@@ -273,6 +273,26 @@ function checkRateLimit($db, $actionKey, $maxHits = 15, $windowSeconds = 60) {
   return true;
 }
 
+function cleanupStaleChunks($chunkDir, $maxAge = 7200) {
+  if (!is_dir($chunkDir)) return;
+  $now = time();
+  $items = @scandir($chunkDir) ?: [];
+  foreach ($items as $item) {
+    if ($item === '.' || $item === '..' || $item === '.htaccess') continue;
+    $targetPath = $chunkDir . DIRECTORY_SEPARATOR . $item;
+    if (is_dir($targetPath)) {
+      $dirMtime = @filemtime($targetPath) ?: 0;
+      if (($now - $dirMtime) > $maxAge) {
+        $files = @scandir($targetPath) ?: [];
+        foreach ($files as $f) {
+          if ($f !== '.' && $f !== '..') @unlink($targetPath . DIRECTORY_SEPARATOR . $f);
+        }
+        @rmdir($targetPath);
+      }
+    }
+  }
+}
+
 function logActivity($db, $userId, $action, $targetId = 0, $details = '') {
   $stmt = $db->prepare("INSERT INTO activity_log (user_id, action, target_id, details, created_at) VALUES (?, ?, ?, ?, ?)");
   $stmt->execute([$userId, $action, $targetId, $details, time()]);
@@ -383,7 +403,35 @@ function createThumbnail($src, $dest, $targetWidth = 480, $quality = 88) {
   return $ok;
 }
 
+function getFileMime($path, $fallback = 'image/jpeg') {
+  $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+  $map = [
+    'jpg'  => 'image/jpeg',
+    'jpeg' => 'image/jpeg',
+    'png'  => 'image/png',
+    'gif'  => 'image/gif',
+    'webp' => 'image/webp',
+    'avif' => 'image/avif',
+    'bmp'  => 'image/bmp',
+    'svg'  => 'image/svg+xml',
+    'mp4'  => 'video/mp4',
+    'webm' => 'video/webm',
+    'mov'  => 'video/quicktime',
+    'mkv'  => 'video/x-matroska',
+    'ogg'  => 'video/ogg'
+  ];
+  if (isset($map[$ext])) return $map[$ext];
+  if (function_exists('mime_content_type')) {
+    $detected = @mime_content_type($path);
+    if ($detected && $detected !== 'application/octet-stream') return $detected;
+  }
+  return $fallback;
+}
+
 function streamRangeFile($path, $mime) {
+  if (empty($mime) || $mime === 'application/octet-stream') {
+    $mime = getFileMime($path);
+  }
   if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
   @ini_set('zlib.output_compression', 'Off');
   while (ob_get_level() > 0) @ob_end_clean();
@@ -811,6 +859,11 @@ if ($action) {
       jsonResponse(['error' => 'Upload rate limit exceeded. Please wait.'], 429);
     }
 
+    // Opportunistically garbage collect abandoned chunks older than 2 hours
+    if (mt_rand(1, 15) === 1) {
+      cleanupStaleChunks($config['chunk_dir'], 7200);
+    }
+
     $uploadId = preg_replace('/[^\w\-]/', '', $_POST['upload_id'] ?? '');
     $chunkIndex = intval($_POST['chunk_index'] ?? 0);
     $totalChunks = intval($_POST['total_chunks'] ?? 1);
@@ -821,8 +874,21 @@ if ($action) {
       jsonResponse(['error' => 'Invalid chunk parameters.'], 400);
     }
 
-    if (!$uploadId || !$fileName || empty($_FILES['chunk']['tmp_name'])) {
+    if (!$uploadId || strlen($uploadId) > 64 || !$fileName || empty($_FILES['chunk']['tmp_name'])) {
       jsonResponse(['error' => 'Missing chunk payload'], 400);
+    }
+
+    // Cap pending staging directories to prevent storage exhaustion attacks
+    $tempDir = $config['chunk_dir'] . DIRECTORY_SEPARATOR . $uploadId;
+    if (!is_dir($tempDir)) {
+      $stagedUploads = glob($config['chunk_dir'] . DIRECTORY_SEPARATOR . '*', GLOB_ONLYDIR) ?: [];
+      if (count($stagedUploads) >= 80) {
+        cleanupStaleChunks($config['chunk_dir'], 3600);
+        $stagedUploads = glob($config['chunk_dir'] . DIRECTORY_SEPARATOR . '*', GLOB_ONLYDIR) ?: [];
+        if (count($stagedUploads) >= 80) {
+          jsonResponse(['error' => 'Temporary upload capacity full. Please wait a moment.'], 503);
+        }
+      }
     }
 
     if ($_FILES['chunk']['size'] > ($config['max_chunk_size'] + 65536)) {
@@ -841,6 +907,7 @@ if ($action) {
     if (!@move_uploaded_file($_FILES['chunk']['tmp_name'], $chunkFile)) {
       jsonResponse(['error' => 'Failed to save chunk.'], 500);
     }
+    @touch($tempDir);
 
     $allReady = true;
     for ($i = 0; $i < $totalChunks; $i++) {
@@ -1441,6 +1508,79 @@ if ($action) {
     jsonResponse($art);
   }
 
+  if ($action === 'artwork_zip') {
+    $artworkId = intval($_GET['id'] ?? 0);
+    if ($artworkId <= 0) {
+      jsonResponse(['error' => 'Invalid artwork ID.'], 400);
+    }
+
+    if (!class_exists('ZipArchive')) {
+      jsonResponse(['error' => 'Server ZipArchive extension is not available.'], 500);
+    }
+
+    $stmt = $db->prepare("SELECT id, title FROM artworks WHERE id = ?");
+    $stmt->execute([$artworkId]);
+    $art = $stmt->fetch();
+    if (!$art) {
+      jsonResponse(['error' => 'Artwork not found.'], 404);
+    }
+
+    $stmtImgs = $db->prepare("SELECT file_name FROM artwork_images WHERE artwork_id = ? ORDER BY sort_order ASC, id ASC");
+    $stmtImgs->execute([$artworkId]);
+    $images = $stmtImgs->fetchAll();
+    if (empty($images)) {
+      jsonResponse(['error' => 'No images found for this artwork.'], 404);
+    }
+
+    $tempZip = $config['chunk_dir'] . DIRECTORY_SEPARATOR . 'zip_' . $artworkId . '_' . bin2hex(random_bytes(6)) . '.tmp';
+    $zip = new ZipArchive();
+    if ($zip->open($tempZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+      jsonResponse(['error' => 'Failed to initialize ZIP archive.'], 500);
+    }
+
+    $padLen = max(2, strlen((string)count($images)));
+    foreach ($images as $idx => $img) {
+      $fName = $img['file_name'];
+      $fPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $fName;
+      if (file_exists($fPath) && is_file($fPath)) {
+        $ext = pathinfo($fName, PATHINFO_EXTENSION);
+        $entryName = str_pad((string)($idx + 1), $padLen, '0', STR_PAD_LEFT) . '.' . $ext;
+        $zip->addFile($fPath, $entryName);
+      }
+    }
+    $zip->close();
+
+    if (!file_exists($tempZip) || filesize($tempZip) === 0) {
+      @unlink($tempZip);
+      jsonResponse(['error' => 'Failed to build ZIP file.'], 500);
+    }
+
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    @ini_set('zlib.output_compression', 'Off');
+    while (ob_get_level() > 0) @ob_end_clean();
+
+    $zipSize = filesize($tempZip);
+    $safeTitle = preg_replace('/[^\w\-\.]+/u', '_', trim($art['title'])) ?: 'artwork';
+    $downloadName = "{$safeTitle}_{$art['id']}.zip";
+
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . $downloadName . '"; filename*=UTF-8\'\'' . rawurlencode($downloadName));
+    header('Content-Length: ' . $zipSize);
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('X-Content-Type-Options: nosniff');
+
+    $fp = @fopen($tempZip, 'rb');
+    if ($fp) {
+      while (!feof($fp)) {
+        echo fread($fp, 256 * 1024);
+        @flush();
+      }
+      fclose($fp);
+    }
+    @unlink($tempZip);
+    exit;
+  }
+
   if ($action === 'artwork_like') {
     verifyCsrfToken();
     $artworkId = intval($_POST['artwork_id'] ?? 0);
@@ -1930,15 +2070,15 @@ if ($action) {
         }
       }
       if (file_exists($thumbCandidate)) {
-        $mime = mime_content_type($thumbCandidate) ?: 'image/jpeg';
+        $mime = getFileMime($thumbCandidate, 'image/jpeg');
         streamRangeFile($thumbCandidate, $mime);
       } elseif (file_exists($rawPath)) {
-        $mime = mime_content_type($rawPath) ?: 'application/octet-stream';
+        $mime = getFileMime($rawPath, 'image/jpeg');
         streamRangeFile($rawPath, $mime);
       }
     } else {
       if (file_exists($rawPath)) {
-        $mime = mime_content_type($rawPath) ?: 'application/octet-stream';
+        $mime = getFileMime($rawPath, 'image/jpeg');
         streamRangeFile($rawPath, $mime);
       }
     }
@@ -3255,6 +3395,33 @@ if ($action) {
               if (q) this.nav(`#/?q=${encodeURIComponent(q)}`);
             }
           });
+
+          window.addEventListener('keydown', (e) => {
+            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+            const tag = (e.target.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+            const modal = document.getElementById('modal-backdrop');
+            if (modal && modal.classList.contains('active')) return;
+
+            const hash = window.location.hash || '';
+            if (!hash.startsWith('#/artwork/')) return;
+
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault();
+              if (this.currentPrevPostId) {
+                this.navigateToArtwork(this.currentPrevPostId);
+              } else {
+                this.toast('No previous post.');
+              }
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault();
+              if (this.currentNextPostId) {
+                this.navigateToArtwork(this.currentNextPostId);
+              } else {
+                this.toast('No next post.');
+              }
+            }
+          });
         }
 
         getAvatar(avatarUrl, artistName = 'Artist', emailHash = '') {
@@ -3272,7 +3439,8 @@ if ($action) {
 
         handleAvatarError(img, name) {
           img.onerror = null;
-          img.src = this.getAvatar('', name);
+          const fallbackName = name || img.getAttribute('data-artist-name') || 'Artist';
+          img.src = this.getAvatar('', fallbackName);
         }
   
         renderUserSlot() {
@@ -3285,7 +3453,7 @@ if ($action) {
             const isAdmin = Number(this.user.is_admin) >= 1;
             slot.innerHTML = `
               <div style="cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:0;" onclick="app.nav('#/user/${this.user.id}')" title="${this.escape(this.user.artist_name)}">
-                <img src="${avatarUrl}" alt="" onerror="app.handleAvatarError(this, '${this.escape(this.user.artist_name)}')" style="width:34px; height:34px; border-radius:50%; object-fit:cover; border:2px solid var(--accent); background:var(--bg-surface-elevated); display:block;">
+                <img src="${avatarUrl}" alt="" data-artist-name="${this.escape(this.user.artist_name)}" onerror="app.handleAvatarError(this)" style="width:34px; height:34px; border-radius:50%; object-fit:cover; border:2px solid var(--accent); background:var(--bg-surface-elevated); display:block;">
               </div>
             `;
 
@@ -3733,9 +3901,9 @@ if ($action) {
                     <div class="art-card-info">
                       <div class="art-card-title">${this.escape(art.title)}</div>
                       <div class="art-card-author">
-                        <img src="${avatarUrl}" class="art-card-avatar" alt="" onerror="app.handleAvatarError(this, '${this.escape(art.artist_name)}')">
+                        <img src="${avatarUrl}" class="art-card-avatar" alt="" data-artist-name="${this.escape(art.artist_name)}" onerror="app.handleAvatarError(this)">
                         <span>${this.escape(art.artist_name)}</span>
-                      </div>
+                  </div>
                       ${previewTags.length ? `
                         <div class="art-card-tags-preview">
                           ${previewTags.map(t => `<span class="art-card-tag-badge">#${this.escape(t)}</span>`).join('')}
@@ -4506,25 +4674,33 @@ if ($action) {
             const leadImg = images[0] || {};
             const isLeadVid = art.type === 'video' || (leadImg.mime_type && leadImg.mime_type.startsWith('video/'));
   
-            // Previous/next post IDs for touch swipe navigation
-            const prevPostId = art.prev_id !== undefined ? art.prev_id : (parseInt(art.id) > 1 ? parseInt(art.id) - 1 : null);
-            const nextPostId = art.next_id !== undefined ? art.next_id : (parseInt(art.id) + 1);
+            // Previous/next post IDs for touch swipe and keyboard navigation
+            const prevPostId = art.prev_id || null;
+            const nextPostId = art.next_id || null;
+            this.currentPrevPostId = prevPostId;
+            this.currentNextPostId = nextPostId;
 
             let mediaHtml = '';
             if (images.length > 1) {
               const firstIsVid = (leadImg.mime_type && leadImg.mime_type.startsWith('video/')) || /\.(mp4|webm|mov|mkv|ogg)$/i.test(leadImg.file_name || '');
               mediaHtml = `
                 <div class="viewer-media-wrap" id="artwork-media-container" style="display:flex; flex-direction:column; gap:0.75rem;">
-                  <div style="display:flex; justify-content:space-between; align-items:center; padding:0.1rem 0.2rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; padding:0.1rem 0.2rem; flex-wrap:wrap; gap:0.5rem;">
                     <span id="page-indicator-text" style="font-size:0.85rem; font-weight:600; color:var(--text-secondary);">Page 1 of ${images.length}</span>
-                    <button class="btn-primary" id="btn-see-all-toggle" style="height:32px; font-size:0.78rem; gap:0.4rem;" onclick="app.toggleSeeAllPages()">
-                      <svg viewBox="0 0 24 24" style="width:15px;height:15px;"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
-                      <span>See All (${images.length} Pages)</span>
-                    </button>
+                    <div style="display:flex; gap:0.45rem; align-items:center;">
+                      <button type="button" class="btn-subtle" style="height:32px; font-size:0.78rem; gap:0.35rem;" onclick="app.downloadArtworkZip(${art.id})">
+                        <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                        <span>Download ZIP</span>
+                      </button>
+                      <button class="btn-primary" id="btn-see-all-toggle" style="height:32px; font-size:0.78rem; gap:0.4rem;" onclick="app.toggleSeeAllPages()">
+                        <svg viewBox="0 0 24 24" style="width:15px;height:15px;"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+                        <span>See All (${images.length} Pages)</span>
+                      </button>
+                    </div>
                   </div>
 
                   <div id="single-page-preview-box" style="display:flex; flex-direction:column; background:#000; border-radius:16px; overflow:hidden; border:1px solid var(--border-subtle); box-shadow:var(--shadow-md); width:100%; position:relative;">
-                    <div id="preview-media-inner" style="display:flex; justify-content:center; position:relative; align-items:center; width:100%; background:#08080a;">
+                    <div id="preview-media-inner" style="display:flex; justify-content:center; position:relative; align-items:center; width:100%; background:#08080a; ${firstIsVid ? '' : 'cursor:pointer;'}" data-file="${this.escape(leadImg.file_name || '')}" ${firstIsVid ? '' : 'onclick="app.toggleHdOriginal(this)"'}>
                       ${firstIsVid ? `
                         <video controls autoplay loop playsinline style="width:100%; height:auto; display:block; background:#000;">
                           <source src="?action=raw&f=${encodeURIComponent(leadImg.file_name)}" type="${leadImg.mime_type || 'video/mp4'}">
@@ -4532,7 +4708,13 @@ if ($action) {
                       ` : `
                         <div class="spinner" id="preview-loading-spinner" style="position:absolute; margin:auto; display:none;"></div>
                         <img id="main-artwork-display" src="?action=thumb&f=${encodeURIComponent(leadImg.file_name || '')}"
-                             style="width:100%; height:auto; display:block; opacity:1;" alt="">
+                             data-raw="?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}"
+                             data-loaded="0"
+                             onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}';"
+                             style="width:100%; height:auto; display:block; opacity:1; transition:opacity 0.2s ease-in-out;" alt="">
+                        <div id="hd-indicator-badge" style="position:absolute; bottom:12px; right:12px; background:rgba(0,0,0,0.72); backdrop-filter:blur(4px); color:#fff; font-size:0.72rem; font-weight:700; padding:0.25rem 0.6rem; border-radius:6px; border:1px solid rgba(255,255,255,0.2); pointer-events:none;">
+                          Tap for Original HD
+                        </div>
                       `}
                     </div>
                   </div>
@@ -4562,7 +4744,9 @@ if ($action) {
                               <source src="?action=raw&f=${encodeURIComponent(img.file_name)}" type="${img.mime_type || 'video/mp4'}">
                             </video>
                           ` : `
-                            <img src="?action=raw&f=${encodeURIComponent(img.file_name)}" alt="" loading="lazy">
+                            <a href="?action=raw&f=${encodeURIComponent(img.file_name)}" target="_blank" rel="noopener noreferrer" style="display:block; width:100%; cursor:zoom-in;" title="Tap to view full original image">
+                              <img src="?action=raw&f=${encodeURIComponent(img.file_name)}" alt="" loading="lazy" style="width:100%; height:auto; display:block;">
+                            </a>
                           `}
                         </div>
                       `;
@@ -4582,11 +4766,12 @@ if ($action) {
             } else {
               mediaHtml = `
                 <div class="viewer-media-wrap" id="artwork-media-container" style="display:flex; flex-direction:column; background:#000; border-radius:16px; overflow:hidden; border:1px solid var(--border-subtle); box-shadow:var(--shadow-md); width:100%; position:relative;">
-                  <div style="display:flex; justify-content:center; position:relative; align-items:center; width:100%; background:#08080a; cursor:pointer;" onclick="app.toggleHdOriginal(this, '${this.escape(leadImg.file_name)}')">
+                  <div style="display:flex; justify-content:center; position:relative; align-items:center; width:100%; background:#08080a; cursor:pointer;" data-file="${this.escape(leadImg.file_name || '')}" onclick="app.toggleHdOriginal(this)">
                     <div class="spinner" id="preview-loading-spinner" style="position:absolute; margin:auto; display:none;"></div>
                     <img id="main-artwork-display" src="?action=thumb&f=${encodeURIComponent(leadImg.file_name || '')}"
                          data-raw="?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}"
                          data-loaded="0"
+                         onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}';"
                          style="width:100%; height:auto; display:block; opacity:1; transition:opacity 0.2s ease-in-out;"
                          alt="">
                     <div id="hd-indicator-badge" style="position:absolute; bottom:12px; right:12px; background:rgba(0,0,0,0.72); backdrop-filter:blur(4px); color:#fff; font-size:0.72rem; font-weight:700; padding:0.25rem 0.6rem; border-radius:6px; border:1px solid rgba(255,255,255,0.2); pointer-events:none;">
@@ -4651,14 +4836,21 @@ if ($action) {
                         <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
                         <span>Like (${art.like_count || 0})</span>
                       </button>
-                      <button class="btn-subtle" style="gap:0.4rem;" onclick="app.showShareModal(${art.id}, '${this.escape(art.title)}', '${this.escape(art.artist_name)}')">
+                      <button class="btn-subtle" style="gap:0.4rem;" data-id="${art.id}" data-title="${this.escape(art.title)}" data-artist="${this.escape(art.artist_name)}" onclick="app.showShareModal(this.dataset.id, this.dataset.title, this.dataset.artist)">
                         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92c0-1.61-1.31-2.92-2.92-2.92z"/></svg>
                         <span>Share</span>
                       </button>
-                      <a href="?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}" download class="btn-subtle" style="gap:0.4rem;">
-                        <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                        <span>Download</span>
-                      </a>
+                      ${images.length > 1 ? `
+                        <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.downloadArtworkZip(${art.id})">
+                          <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                          <span>Download All (${images.length}P ZIP)</span>
+                        </button>
+                      ` : `
+                        <a href="?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}" download class="btn-subtle" style="gap:0.4rem;">
+                          <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                          <span>Download</span>
+                        </a>
+                      `}
                     </div>
                   </div>
   
@@ -4682,7 +4874,7 @@ if ($action) {
                 <div class="viewer-sidebar">
                   <div class="author-card">
                     <div class="author-header">
-                      <img src="${avatarUrl}" class="author-avatar-lg" alt="" onerror="app.handleAvatarError(this, '${this.escape(art.artist_name)}')">
+                      <img src="${avatarUrl}" class="author-avatar-lg" alt="" data-artist-name="${this.escape(art.artist_name)}" onerror="app.handleAvatarError(this)">
                       <div class="author-names">
                         <span class="author-artist-name">${this.escape(art.artist_name)}</span>
                       </div>
@@ -4739,19 +4931,28 @@ if ($action) {
           const isV = (imgObj.mime_type && imgObj.mime_type.startsWith('video/')) || /\.(mp4|webm|mov|mkv|ogg)$/i.test(imgObj.file_name);
 
           if (previewInner) {
+            previewInner.dataset.file = imgObj.file_name || '';
             if (isV) {
+              previewInner.onclick = null;
+              previewInner.style.cursor = 'default';
               previewInner.innerHTML = `
                 <video controls autoplay loop playsinline style="width:100%; height:auto; display:block; background:#000;">
                   <source src="?action=raw&f=${encodeURIComponent(imgObj.file_name)}" type="${imgObj.mime_type || 'video/mp4'}">
                 </video>
               `;
             } else {
+              previewInner.onclick = () => this.toggleHdOriginal(previewInner);
+              previewInner.style.cursor = 'pointer';
               previewInner.innerHTML = `
-                <div class="spinner" id="preview-loading-spinner" style="position:absolute; margin:auto;"></div>
-                <img id="main-artwork-display" src="?action=raw&f=${encodeURIComponent(imgObj.file_name)}"
-                     style="width:100%; height:auto; display:block; opacity:0; transition:opacity 0.2s ease-in-out;"
-                     onload="this.style.opacity='1'; const sp=document.getElementById('preview-loading-spinner'); if(sp) sp.style.display='none';"
-                     onerror="this.onerror=null; this.src='?action=thumb&f=${encodeURIComponent(imgObj.file_name)}'; const sp=document.getElementById('preview-loading-spinner'); if(sp) sp.style.display='none';" alt="">
+                <div class="spinner" id="preview-loading-spinner" style="position:absolute; margin:auto; display:none;"></div>
+                <img id="main-artwork-display" src="?action=thumb&f=${encodeURIComponent(imgObj.file_name)}"
+                     data-raw="?action=raw&f=${encodeURIComponent(imgObj.file_name)}"
+                     data-loaded="0"
+                     style="width:100%; height:auto; display:block; opacity:1; transition:opacity 0.2s ease-in-out;"
+                     onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(imgObj.file_name)}';" alt="">
+                <div id="hd-indicator-badge" style="position:absolute; bottom:12px; right:12px; background:rgba(0,0,0,0.72); backdrop-filter:blur(4px); color:#fff; font-size:0.72rem; font-weight:700; padding:0.25rem 0.6rem; border-radius:6px; border:1px solid rgba(255,255,255,0.2); pointer-events:none;">
+                  Tap for Original HD
+                </div>
               `;
             }
           }
@@ -4770,10 +4971,11 @@ if ($action) {
         }
 
         toggleHdOriginal(containerEl, fileName) {
+          const targetFile = fileName || containerEl?.dataset?.file || this.getCurrentLeadFileName() || '';
           const img = document.getElementById('main-artwork-display');
           const badge = document.getElementById('hd-indicator-badge');
           const spinner = document.getElementById('preview-loading-spinner');
-          if (!img) return;
+          if (!img || !targetFile) return;
 
           if (img.dataset.loaded === '1') {
             this.toast('Already viewing original resolution.');
@@ -4784,7 +4986,7 @@ if ($action) {
           if (badge) badge.innerText = 'Loading HD...';
 
           const fullImg = new Image();
-          fullImg.src = `?action=raw&f=${encodeURIComponent(fileName)}`;
+          fullImg.src = `?action=raw&f=${encodeURIComponent(targetFile)}`;
           fullImg.onload = () => {
             img.src = fullImg.src;
             img.dataset.loaded = '1';
@@ -4802,6 +5004,118 @@ if ($action) {
             if (badge) badge.innerText = 'Tap for Original HD';
             this.toast('Failed to load original image.');
           };
+        }
+
+        async downloadArtworkZip(artworkId) {
+          const modalHtml = `
+            <div class="modal-header">
+              <span>Downloading Artwork ZIP</span>
+              <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+            </div>
+            <div class="modal-body" style="gap:1rem;">
+              <div style="display:flex; align-items:center; gap:0.75rem;">
+                <div class="spinner" id="zip-spinner" style="margin:0; width:26px; height:26px; flex-shrink:0;"></div>
+                <div style="min-width:0; flex:1;">
+                  <div id="zip-status-title" style="font-weight:700; font-size:0.95rem;">Preparing ZIP Archive...</div>
+                  <div id="zip-status-subtitle" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.2rem;">Connecting to server...</div>
+                </div>
+              </div>
+
+              <div style="width:100%; background:var(--bg-base); height:10px; border-radius:5px; overflow:hidden; border:1px solid var(--border-subtle);">
+                <div id="zip-progress-fill" style="width:0%; height:100%; background:var(--accent); border-radius:5px; transition:width 0.15s ease;"></div>
+              </div>
+
+              <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--text-secondary);">
+                <span id="zip-bytes-text">0 MB / 0 MB</span>
+                <span id="zip-percent-text" style="font-weight:700; color:var(--accent);">0%</span>
+              </div>
+            </div>
+          `;
+          this.showModal(modalHtml);
+
+          try {
+            const res = await fetch(`?action=artwork_zip&id=${artworkId}`);
+            if (!res.ok) {
+              let errMsg = 'Failed to generate ZIP archive.';
+              try {
+                const errJson = await res.json();
+                if (errJson.error) errMsg = errJson.error;
+              } catch(e) {}
+              throw new Error(errMsg);
+            }
+
+            const contentLength = res.headers.get('content-length');
+            const totalBytes = contentLength ? parseInt(contentLength, 10) : 0;
+            const reader = res.body.getReader();
+            const chunks = [];
+            let receivedBytes = 0;
+
+            const statusTitle = document.getElementById('zip-status-title');
+            const statusSubtitle = document.getElementById('zip-status-subtitle');
+            const progressFill = document.getElementById('zip-progress-fill');
+            const bytesText = document.getElementById('zip-bytes-text');
+            const percentText = document.getElementById('zip-percent-text');
+
+            if (statusTitle) statusTitle.innerText = 'Downloading images...';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+              receivedBytes += value.length;
+
+              if (totalBytes > 0) {
+                const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
+                if (progressFill) progressFill.style.width = `${pct}%`;
+                if (percentText) percentText.innerText = `${pct}%`;
+                const recMB = (receivedBytes / (1024 * 1024)).toFixed(1);
+                const totMB = (totalBytes / (1024 * 1024)).toFixed(1);
+                if (bytesText) bytesText.innerText = `${recMB} MB / ${totMB} MB`;
+                if (statusSubtitle) statusSubtitle.innerText = `${pct}% received`;
+              } else {
+                const recMB = (receivedBytes / (1024 * 1024)).toFixed(1);
+                if (bytesText) bytesText.innerText = `${recMB} MB`;
+                if (progressFill) progressFill.style.width = '100%';
+              }
+            }
+
+            if (statusTitle) statusTitle.innerText = 'Finalizing package...';
+            const blob = new Blob(chunks, { type: 'application/zip' });
+
+            let downloadName = `artwork_${artworkId}.zip`;
+            const dispo = res.headers.get('content-disposition');
+            if (dispo) {
+              const match = dispo.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+              if (match && match[1]) downloadName = decodeURIComponent(match[1]);
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = blobUrl;
+            link.download = downloadName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+
+            if (statusTitle) statusTitle.innerText = 'Download Completed!';
+            if (statusSubtitle) statusSubtitle.innerText = 'ZIP file saved to your device.';
+            const spinner = document.getElementById('zip-spinner');
+            if (spinner) spinner.style.display = 'none';
+
+            setTimeout(() => this.closeModal(), 1200);
+          } catch(err) {
+            const statusTitle = document.getElementById('zip-status-title');
+            const statusSubtitle = document.getElementById('zip-status-subtitle');
+            const progressFill = document.getElementById('zip-progress-fill');
+            if (statusTitle) {
+              statusTitle.innerText = 'Download Failed';
+              statusTitle.style.color = 'var(--r18)';
+            }
+            if (statusSubtitle) statusSubtitle.innerText = err.message;
+            if (progressFill) progressFill.style.background = 'var(--r18)';
+            this.toast(err.message);
+          }
         }
 
         navigateToArtwork(targetId) {
@@ -4896,7 +5210,7 @@ if ($action) {
   
           return `
             <div class="comment-tree-node" id="comm-${c.id}">
-              <img src="${cAvatar}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; background:var(--bg-surface-elevated);" alt="" onerror="app.handleAvatarError(this, '${this.escape(c.artist_name)}')">
+              <img src="${cAvatar}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; background:var(--bg-surface-elevated);" alt="" data-artist-name="${this.escape(c.artist_name)}" onerror="app.handleAvatarError(this)">
               <div style="flex:1;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                   <span style="font-weight:700; font-size:0.85rem; cursor:pointer;" onclick="app.nav('#/user/${c.user_id}')">${this.escape(c.artist_name)}</span>
@@ -5021,7 +5335,7 @@ if ($action) {
             let html = `
               <div style="width:100%; height:190px; border-radius:18px; ${bannerStyle} position:relative; margin-bottom:3.8rem; box-shadow:var(--shadow-sm);">
                 <div style="position:absolute; bottom:-38px; left:1.8rem; display:flex; align-items:flex-end; gap:1rem;">
-                  <img src="${avatarUrl}" style="width:92px; height:92px; border-radius:50%; object-fit:cover; border:4px solid var(--bg-surface); background:var(--bg-surface-elevated);" alt="" onerror="app.handleAvatarError(this, '${this.escape(prof.artist_name)}')">
+                  <img src="${avatarUrl}" style="width:92px; height:92px; border-radius:50%; object-fit:cover; border:4px solid var(--bg-surface); background:var(--bg-surface-elevated);" alt="" data-artist-name="${this.escape(prof.artist_name)}" onerror="app.handleAvatarError(this)">
                 </div>
               </div>
 
@@ -5645,7 +5959,7 @@ if ($action) {
 
               ${hasNativeShare ? `
                 <div>
-                  <button type="button" class="btn-primary" style="width:100%; height:38px; gap:0.45rem;" onclick="app.triggerNativeShare('${this.escape(shareText)}', '${this.escape(shareUrl)}')">
+                  <button type="button" class="btn-primary" style="width:100%; height:38px; gap:0.45rem;" data-text="${this.escape(shareText)}" data-url="${this.escape(shareUrl)}" onclick="app.triggerNativeShare(this.dataset.text, this.dataset.url)">
                     <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92c0-1.61-1.31-2.92-2.92-2.92z"/></svg>
                     <span>Share via Device...</span>
                   </button>
@@ -6201,7 +6515,13 @@ if ($action) {
         }
 
         escape(str) {
-          return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+          return (str || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/`/g, '&#96;');
         }
       }
   
