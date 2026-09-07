@@ -3408,17 +3408,17 @@ if ($action) {
 
             if (e.key === 'ArrowLeft') {
               e.preventDefault();
-              if (this.currentPrevPostId) {
-                this.navigateToArtwork(this.currentPrevPostId);
-              } else {
-                this.toast('No previous post.');
-              }
-            } else if (e.key === 'ArrowRight') {
-              e.preventDefault();
               if (this.currentNextPostId) {
                 this.navigateToArtwork(this.currentNextPostId);
               } else {
                 this.toast('No next post.');
+              }
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault();
+              if (this.currentPrevPostId) {
+                this.navigateToArtwork(this.currentPrevPostId);
+              } else {
+                this.toast('No previous post.');
               }
             }
           });
