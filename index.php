@@ -2342,7 +2342,7 @@ if ($action) {
       $entry['revision_count'] = max(1, (int)$entry['revision_count']);
     }
 
-    // Resolve most viewed 1:1 image representation (Like Pixiv Encyclopedia)
+    // Resolve most viewed 1:1 image representation
     $topArt = null;
     if ($category === 'tag') {
       $stTop = $db->prepare("
@@ -3429,6 +3429,13 @@ if ($action) {
         flex-direction: column;
         gap: 0.75rem;
         box-shadow: var(--shadow-sm);
+      }
+      .encyclopedia-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.8rem;
       }
       .encyclopedia-main-row {
         display: flex;
@@ -5057,7 +5064,7 @@ if ($action) {
                     <span class="encyclopedia-badge ${category}">${label}</span>
                     <h2 style="font-size:1.15rem; font-weight:800; margin:0;">${this.escape(name)}</h2>
                     <span style="font-size:0.75rem; color:var(--text-muted); background:var(--bg-surface-elevated); padding:0.15rem 0.5rem; border-radius:4px; font-weight:600;">
-                      Pixiv-style Community Wiki
+                      Community Wiki
                     </span>
                   </div>
                   <div style="display:flex; gap:0.4rem; align-items:center;">
@@ -5149,7 +5156,7 @@ if ($action) {
 
                 <div style="font-size:0.75rem; color:var(--text-muted); border-top:1px solid var(--border-subtle); padding-top:0.6rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem;">
                   <span>${res.editor_name ? `Last editor: <strong>${this.escape(res.editor_name)}</strong>` : 'Community Encyclopedia'}</span>
-                  <span>All registered members can edit &bull; Pixiv-style</span>
+                  <span>All registered members can edit</span>
                 </div>
               </div>
               <div class="modal-footer" style="justify-content:space-between;">
@@ -5434,9 +5441,14 @@ if ($action) {
           const hash = window.location.hash || '#/';
           const [base, queryStr] = hash.split('?');
           const p = new URLSearchParams(queryStr || '');
-          p.set(key, val);
+          if (val === '' || val === null || val === undefined) {
+            p.delete(key);
+          } else {
+            p.set(key, val);
+          }
           if (key !== 'page') p.delete('page');
-          this.nav(`${base}?${p.toString()}`);
+          const qs = p.toString();
+          this.nav(qs ? `${base}?${qs}` : base);
         }
 
         showJumpPageModal(currentPage, totalPages) {
@@ -7013,6 +7025,9 @@ if ($action) {
             const rawHash = window.location.hash || '';
             const [_, profQueryStr] = rawHash.split('?');
             const profParams = new URLSearchParams(profQueryStr || '');
+            const profQuery = profParams.get('q') || '';
+            const profSort = profParams.get('sort') || 'newest';
+            const profRating = profParams.get('rating') || 'all';
             const profPage = Math.max(1, parseInt(profParams.get('page') || '1', 10));
 
             const prof = await this.api('user_profile', { user: userId });
@@ -7021,7 +7036,16 @@ if ($action) {
             const avatarUrl = this.getAvatar(prof.avatar, prof.artist_name, prof.email_hash);
             const bannerStyle = prof.banner ? `background-image: url('${prof.banner}'); background-size: cover; background-position: center;` : `background: linear-gradient(135deg, #0096fa, #ff4772);`;
 
-            const arts = await this.api('artworks_list', { user_id: prof.id, limit: 24, page: profPage });
+            const reqData = {
+              user_id: prof.id,
+              limit: 24,
+              page: profPage,
+              sort: profSort,
+              rating: profRating
+            };
+            if (profQuery) reqData.q = profQuery;
+
+            const arts = await this.api('artworks_list', reqData);
 
             let html = `
               <div style="width:100%; height:190px; border-radius:18px; ${bannerStyle} position:relative; margin-bottom:3.8rem; box-shadow:var(--shadow-sm);">
@@ -7052,11 +7076,33 @@ if ($action) {
                 </div>
               </div>
 
-              <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:1rem;">Artworks &amp; Creations (${arts.total})</h3>
+              <div class="feed-header-wrap" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.4rem; flex-wrap:wrap; gap:0.8rem;">
+                <div>
+                  <h3 style="font-size:1.2rem; font-weight:800; margin:0;">Artworks &amp; Creations</h3>
+                  <p style="font-size:0.8rem; color:var(--text-muted); margin-top:0.2rem;">${arts.total} work${arts.total === 1 ? '' : 's'} available</p>
+                </div>
+                <div class="feed-header-controls" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+                  <div class="search-bar" style="width:210px; height:36px;">
+                    <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+                    <input type="text" placeholder="Search creations..." value="${this.escape(profQuery)}" onkeydown="if(event.key==='Enter') app.updateParam('q', this.value.trim())">
+                  </div>
+                  <select class="form-select" style="font-size:0.8rem; height:36px;" onchange="app.updateParam('sort', this.value)">
+                    <option value="newest" ${profSort === 'newest' ? 'selected' : ''}>Newest First</option>
+                    <option value="popular" ${profSort === 'popular' ? 'selected' : ''}>Most Popular</option>
+                    <option value="views" ${profSort === 'views' ? 'selected' : ''}>Most Views</option>
+                    <option value="oldest" ${profSort === 'oldest' ? 'selected' : ''}>Oldest</option>
+                  </select>
+                  <select class="form-select" style="font-size:0.8rem; height:36px;" onchange="app.updateParam('rating', this.value)">
+                    <option value="all" ${profRating === 'all' ? 'selected' : ''}>All Ratings</option>
+                    <option value="safe" ${profRating === 'safe' ? 'selected' : ''}>All Ages Only</option>
+                    <option value="r18" ${profRating === 'r18' ? 'selected' : ''}>R-18 Only</option>
+                  </select>
+                </div>
+              </div>
             `;
 
             if (!arts.artworks || !arts.artworks.length) {
-              html += `<div class="center-msg">No submissions from this artist yet.</div>`;
+              html += `<div class="center-msg">${profQuery || profRating !== 'all' ? 'No creations matched your search or filter.' : 'No submissions from this artist yet.'}</div>`;
             } else {
               html += `<div class="art-grid">`;
               arts.artworks.forEach(art => {
