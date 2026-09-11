@@ -49,6 +49,55 @@ foreach ([$config['data_dir'], $config['upload_dir'], $config['thumb_dir'], $con
   }
 }
 
+function migrateArtworkAssetsFormat($db, $config) {
+  try {
+    $stmt = $db->query("
+      SELECT ai.id as img_id, ai.artwork_id, ai.file_name, ai.sort_order, a.user_id
+      FROM artwork_images ai
+      JOIN artworks a ON ai.artwork_id = a.id
+      WHERE ai.file_name NOT LIKE 'uid_%'
+      ORDER BY ai.artwork_id ASC, ai.sort_order ASC
+    ");
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    if (empty($rows)) return;
+
+    $db->beginTransaction();
+    $updateStmt = $db->prepare("UPDATE artwork_images SET file_name = ? WHERE id = ?");
+
+    foreach ($rows as $row) {
+      $oldRel = $row['file_name'];
+      $oldFullPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $oldRel);
+      $ext = strtolower(pathinfo($oldRel, PATHINFO_EXTENSION)) ?: 'jpg';
+      $sortOrder = (int)$row['sort_order'];
+      $userId = (int)$row['user_id'];
+      $artId = (int)$row['artwork_id'];
+
+      $newRel = "uid_" . $userId . "/data/imageid-" . $sortOrder . "/imageassets_" . $artId . "/" . $artId . "_i" . $sortOrder . "." . $ext;
+      $newFullPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $newRel);
+
+      if (file_exists($oldFullPath) && is_file($oldFullPath)) {
+        $newDir = dirname($newFullPath);
+        if (!is_dir($newDir)) @mkdir($newDir, 0755, true);
+        @rename($oldFullPath, $newFullPath);
+
+        $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($oldRel) . '.jpg';
+        if (!file_exists($oldThumb)) $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($oldRel);
+        $newThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $newRel) . '.jpg';
+        $newThumbDir = dirname($newThumb);
+        if (!is_dir($newThumbDir)) @mkdir($newThumbDir, 0755, true);
+        if (file_exists($oldThumb)) {
+          @rename($oldThumb, $newThumb);
+        }
+      }
+
+      $updateStmt->execute([$newRel, $row['img_id']]);
+    }
+    $db->commit();
+  } catch (Exception $e) {
+    if ($db->inTransaction()) $db->rollBack();
+  }
+}
+
 function getDB($config) {
   static $db = null;
   if ($db === null) {
@@ -202,6 +251,8 @@ function getDB($config) {
 
     $userCols = $db->query("PRAGMA table_info(users)")->fetchAll(PDO::FETCH_COLUMN, 1);
     if (!in_array('is_banned', $userCols)) @$db->exec("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0");
+
+    migrateArtworkAssetsFormat($db, $config);
   }
   return $db;
 }
@@ -1071,6 +1122,24 @@ if ($action) {
           $w = $dim ? $dim[0] : ($img['width'] ?? 0);
           $h = $dim ? $dim[1] : ($img['height'] ?? 0);
 
+          $ext = strtolower(pathinfo($fName, PATHINFO_EXTENSION)) ?: 'jpg';
+          $destRel = "uid_" . $user['id'] . "/data/imageid-0/imageassets_" . $newArtId . "/" . $newArtId . "_i0." . $ext;
+          $destFullPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $destRel);
+
+          if ($fName !== $destRel && file_exists($fPath)) {
+            if (!is_dir(dirname($destFullPath))) @mkdir(dirname($destFullPath), 0755, true);
+            @rename($fPath, $destFullPath);
+
+            $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fName) . '.jpg';
+            if (!file_exists($oldThumb)) $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fName);
+            $newThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $destRel) . '.jpg';
+            if (!is_dir(dirname($newThumb))) @mkdir(dirname($newThumb), 0755, true);
+            if (file_exists($oldThumb)) @rename($oldThumb, $newThumb);
+
+            $fName = $destRel;
+            $fPath = $destFullPath;
+          }
+
           $stmtImg = $db->prepare("
             INSERT INTO artwork_images (artwork_id, file_name, file_size, width, height, mime_type, phash, sort_order, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1146,12 +1215,31 @@ if ($action) {
       foreach ($images as $order => $img) {
         $fName = $img['file_name'] ?? ($img['file_key'] ?? '');
         if (!$fName) continue;
+
+        $ext = strtolower(pathinfo($fName, PATHINFO_EXTENSION)) ?: 'jpg';
+        $destRel = "uid_" . $user['id'] . "/data/imageid-" . $order . "/imageassets_" . $artworkId . "/" . $artworkId . "_i" . $order . "." . $ext;
+        $oldFullPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $fName);
+        $destFullPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $destRel);
+
+        if ($fName !== $destRel && file_exists($oldFullPath)) {
+          if (!is_dir(dirname($destFullPath))) @mkdir(dirname($destFullPath), 0755, true);
+          @rename($oldFullPath, $destFullPath);
+
+          $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fName) . '.jpg';
+          if (!file_exists($oldThumb)) $oldThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fName);
+          $newThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $destRel) . '.jpg';
+          if (!is_dir(dirname($newThumb))) @mkdir(dirname($newThumb), 0755, true);
+          if (file_exists($oldThumb)) @rename($oldThumb, $newThumb);
+
+          $fName = $destRel;
+        }
+
         $keptFiles[] = $fName;
 
         if (isset($existingMap[$fName])) {
           $stmtUpdateImg->execute([$order, $existingMap[$fName]]);
         } else {
-          $fPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $fName;
+          $fPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $fName);
           $sz = file_exists($fPath) ? filesize($fPath) : ($img['size'] ?? 0);
           $dim = @getimagesize($fPath);
           $w = $dim ? $dim[0] : ($img['width'] ?? 0);
@@ -1541,6 +1629,238 @@ if ($action) {
     }
 
     jsonResponse($art);
+  }
+
+  if ($action === 'artwork_export') {
+    $artworkId = intval($_GET['id'] ?? 0);
+    $stmt = $db->prepare("SELECT * FROM artworks WHERE id = ?");
+    $stmt->execute([$artworkId]);
+    $art = $stmt->fetch();
+    if (!$art) jsonResponse(['error' => 'Artwork not found.'], 404);
+
+    if (!class_exists('ZipArchive')) {
+      jsonResponse(['error' => 'Server ZipArchive extension is required.'], 500);
+    }
+
+    $stmtImgs = $db->prepare("SELECT * FROM artwork_images WHERE artwork_id = ? ORDER BY sort_order ASC, id ASC");
+    $stmtImgs->execute([$artworkId]);
+    $rawImages = $stmtImgs->fetchAll();
+
+    $tempZip = $config['chunk_dir'] . DIRECTORY_SEPARATOR . 'export_' . $artworkId . '_' . bin2hex(random_bytes(6)) . '.zip';
+    $zip = new ZipArchive();
+    if ($zip->open($tempZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+      jsonResponse(['error' => 'Failed to initialize export package.'], 500);
+    }
+
+    $itemsList = [];
+    foreach ($rawImages as $idx => $img) {
+      $fPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $img['file_name']);
+      if (file_exists($fPath) && is_file($fPath)) {
+        $ext = strtolower(pathinfo($img['file_name'], PATHINFO_EXTENSION)) ?: 'jpg';
+        $entryName = $idx . '.' . $ext;
+        $zip->addFile($fPath, 'items/' . $entryName);
+        $itemsList[] = [
+          'sort_order' => (int)$img['sort_order'],
+          'file'       => $entryName,
+          'mime_type'  => $img['mime_type'],
+          'width'      => (int)$img['width'],
+          'height'     => (int)$img['height'],
+          'phash'      => $img['phash']
+        ];
+      }
+    }
+
+    $infoPayload = [
+      'hdpost_special_key' => 'HDPOST_EXPORT_KEY_POST_v1_VALIDATED',
+      'version'            => '1.0',
+      'exported_at'        => time(),
+      'artwork'            => [
+        'title'       => $art['title'],
+        'description' => $art['description'],
+        'type'        => $art['type'],
+        'rating'      => $art['rating'],
+        'is_ai'       => (int)$art['is_ai'],
+        'is_original' => (int)$art['is_original'],
+        'tools'       => $art['tools'],
+        'parodies'    => $art['parodies'],
+        'characters'  => $art['characters'],
+        'tags'        => $art['tags'],
+        'source_url'  => $art['source_url']
+      ],
+      'items'              => $itemsList
+    ];
+
+    $zip->addFromString('info.json', json_encode($infoPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $zip->close();
+
+    if (!file_exists($tempZip) || filesize($tempZip) === 0) {
+      @unlink($tempZip);
+      jsonResponse(['error' => 'Failed to build export package.'], 500);
+    }
+
+    $safeTitle = preg_replace('/[^\w\-]+/u', '_', trim($art['title'])) ?: 'artwork';
+    $downloadName = "{$safeTitle}_{$art['id']}_export.zip";
+    $zipSize = filesize($tempZip);
+
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    @ini_set('zlib.output_compression', 'Off');
+    while (ob_get_level() > 0) @ob_end_clean();
+
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . $downloadName . '"; filename*=UTF-8\'\'' . rawurlencode($downloadName));
+    header('Content-Length: ' . $zipSize);
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+
+    $fp = @fopen($tempZip, 'rb');
+    if ($fp) {
+      while (!feof($fp)) {
+        echo fread($fp, 256 * 1024);
+        @flush();
+      }
+      fclose($fp);
+    }
+    @unlink($tempZip);
+    exit;
+  }
+
+  if ($action === 'artwork_import') {
+    verifyCsrfToken();
+    $user = requireAuth($db);
+
+    if (empty($_FILES['import_file']['tmp_name']) || !file_exists($_FILES['import_file']['tmp_name'])) {
+      jsonResponse(['error' => 'Please choose an export file to import.'], 400);
+    }
+
+    $tmpPath = $_FILES['import_file']['tmp_name'];
+    $clientName = $_FILES['import_file']['name'] ?? '';
+    $ext = strtolower(pathinfo($clientName, PATHINFO_EXTENSION));
+
+    $infoData = null;
+    $zipArchive = null;
+
+    if ($ext === 'zip' && class_exists('ZipArchive')) {
+      $zip = new ZipArchive();
+      if ($zip->open($tmpPath) === true) {
+        $infoRaw = $zip->getFromName('info.json');
+        if ($infoRaw !== false) {
+          $infoData = json_decode($infoRaw, true);
+          $zipArchive = $zip;
+        } else {
+          $zip->close();
+        }
+      }
+    }
+
+    if (!$infoData) {
+      $rawContent = @file_get_contents($tmpPath);
+      $infoData = json_decode($rawContent, true);
+    }
+
+    if (!is_array($infoData) || empty($infoData['hdpost_special_key']) || $infoData['hdpost_special_key'] !== 'HDPOST_EXPORT_KEY_POST_v1_VALIDATED') {
+      if ($zipArchive) $zipArchive->close();
+      jsonResponse(['error' => 'Import rejected: missing or invalid special key in info.json.'], 400);
+    }
+
+    $art = $infoData['artwork'] ?? [];
+    $title = trim($art['title'] ?? 'Imported Artwork');
+    $description = trim($art['description'] ?? '');
+    $type = in_array($art['type'] ?? '', ['illust', 'video', 'manga']) ? $art['type'] : 'illust';
+    $rating = in_array($art['rating'] ?? '', ['all', 'r18']) ? $art['rating'] : 'all';
+    $isAi = !empty($art['is_ai']) ? 1 : 0;
+    $isOriginal = isset($art['is_original']) ? (!empty($art['is_original']) ? 1 : 0) : 1;
+    $tools = trim($art['tools'] ?? '');
+    $parodies = trim($art['parodies'] ?? '');
+    $characters = trim($art['characters'] ?? '');
+    $sourceUrl = trim($art['source_url'] ?? '');
+    $rawTags = trim($art['tags'] ?? '');
+    $items = $infoData['items'] ?? ($infoData['images'] ?? []);
+
+    if (empty($items) || !is_array($items)) {
+      if ($zipArchive) $zipArchive->close();
+      jsonResponse(['error' => 'No media items found in the imported package.'], 400);
+    }
+
+    $db->beginTransaction();
+    try {
+      $now = time();
+      $stmt = $db->prepare("
+        INSERT INTO artworks (
+          user_id, title, description, type, rating, is_ai, is_original,
+          tools, parodies, characters, tags, source_url, phash, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+      ");
+      $stmt->execute([
+        $user['id'], $title, $description, $type, $rating, $isAi, $isOriginal,
+        $tools, $parodies, $characters, $rawTags, $sourceUrl, $now, $now
+      ]);
+      $newArtId = (int)$db->lastInsertId();
+
+      $stmtImg = $db->prepare("
+        INSERT INTO artwork_images (artwork_id, file_name, file_size, width, height, mime_type, phash, sort_order, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ");
+
+      $leadHash = '';
+      foreach ($items as $idx => $item) {
+        $binData = '';
+        $itemExt = 'jpg';
+        $mime = $item['mime_type'] ?? 'image/jpeg';
+
+        if ($zipArchive && !empty($item['file'])) {
+          $binData = $zipArchive->getFromName('items/' . $item['file']);
+          $itemExt = strtolower(pathinfo($item['file'], PATHINFO_EXTENSION)) ?: 'jpg';
+        } elseif (!empty($item['data_base64'])) {
+          $binData = base64_decode($item['data_base64']);
+          if (strpos($mime, 'png') !== false) $itemExt = 'png';
+          elseif (strpos($mime, 'gif') !== false) $itemExt = 'gif';
+          elseif (strpos($mime, 'webp') !== false) $itemExt = 'webp';
+          elseif (strpos($mime, 'mp4') !== false) $itemExt = 'mp4';
+          elseif (strpos($mime, 'webm') !== false) $itemExt = 'webm';
+        }
+
+        if ($binData === false || strlen($binData) === 0) continue;
+
+        $destRel = "uid_" . $user['id'] . "/data/imageid-" . $idx . "/imageassets_" . $newArtId . "/" . $newArtId . "_i" . $idx . "." . $itemExt;
+        $destFull = $config['upload_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $destRel);
+
+        if (!is_dir(dirname($destFull))) @mkdir(dirname($destFull), 0755, true);
+        file_put_contents($destFull, $binData);
+
+        $thumbRel = $destRel . '.jpg';
+        $thumbFull = $config['thumb_dir'] . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $thumbRel);
+        if (!is_dir(dirname($thumbFull))) @mkdir(dirname($thumbFull), 0755, true);
+        createThumbnail($destFull, $thumbFull, $config['thumb_width'], $config['thumb_quality']);
+
+        $pHash = compute_phash($thumbFull);
+        if ($idx === 0) $leadHash = $pHash;
+
+        $sz = strlen($binData);
+        $dim = @getimagesize($destFull);
+        $w = $dim ? $dim[0] : (int)($item['width'] ?? 0);
+        $h = $dim ? $dim[1] : (int)($item['height'] ?? 0);
+
+        $stmtImg->execute([$newArtId, $destRel, $sz, $w, $h, $mime, $pHash, $idx, $now]);
+      }
+
+      if ($leadHash) {
+        $db->prepare("UPDATE artworks SET phash = ? WHERE id = ?")->execute([$leadHash, $newArtId]);
+      }
+
+      $tagsArray = array_values(array_unique(array_filter(array_map('trim', preg_split('/[,#、\s]+/u', $rawTags)))));
+      $tagStmt = $db->prepare("INSERT INTO tags (artwork_id, tag_name) VALUES (?, ?)");
+      foreach ($tagsArray as $tName) {
+        if ($tName !== '') $tagStmt->execute([$newArtId, mb_substr($tName, 0, 40)]);
+      }
+
+      if ($zipArchive) $zipArchive->close();
+      $db->commit();
+      logActivity($db, $user['id'], 'artwork_import', $newArtId, "Imported artwork '{$title}'");
+      jsonResponse(['success' => true, 'artwork_id' => $newArtId]);
+    } catch (Exception $e) {
+      if ($zipArchive) $zipArchive->close();
+      $db->rollBack();
+      jsonResponse(['error' => 'Failed to import post: ' . $e->getMessage()], 500);
+    }
   }
 
   if ($action === 'artwork_zip') {
@@ -2073,33 +2393,33 @@ if ($action) {
   }
 
   if ($action === 'thumb' || $action === 'raw') {
-    $rawFile = basename($_GET['f'] ?? '');
-    $file = preg_replace('/[^a-zA-Z0-9_\.-]/', '', $rawFile);
+    $rawFile = str_replace('\\', '/', trim($_GET['f'] ?? ''));
+    if (strpos($rawFile, '..') !== false || strpos($rawFile, ':') !== false) {
+      header('HTTP/1.0 403 Forbidden');
+      exit;
+    }
+    $file = preg_replace('/[^a-zA-Z0-9_\.\/-]/', '', $rawFile);
+    $file = ltrim($file, '/');
     if (!$file || !preg_match('/\.(jpg|jpeg|png|gif|webp|avif|bmp|mp4|webm|mov|mkv|ogg)$/i', $file)) {
       header('HTTP/1.0 404 Not Found');
       exit;
     }
 
     $isThumb = ($action === 'thumb');
-    $rawBaseName = preg_replace('/^thumb_/', '', preg_replace('/\.jpg$/i', '', $file));
-    $rawPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $rawBaseName;
-    if (!file_exists($rawPath)) {
-      $rawPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . preg_replace('/^thumb_/', '', $file);
-    }
-    if (!file_exists($rawPath)) {
-      $rawPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $file;
-    }
+    $osRelPath = str_replace('/', DIRECTORY_SEPARATOR, $file);
+    $rawPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $osRelPath;
 
     if ($isThumb) {
-      $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . $file . '.jpg';
+      $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRelPath . '.jpg';
       if (!file_exists($thumbCandidate)) {
-        $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . $file;
+        $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRelPath;
       }
       if (!file_exists($thumbCandidate)) {
-        $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . $file;
+        $thumbCandidate = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($file) . '.jpg';
       }
       if (!file_exists($thumbCandidate) && file_exists($rawPath)) {
-        $targetThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . $file . '.jpg';
+        $targetThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRelPath . '.jpg';
+        if (!is_dir(dirname($targetThumb))) @mkdir(dirname($targetThumb), 0755, true);
         if (createThumbnail($rawPath, $targetThumb, $config['thumb_width'], $config['thumb_quality'])) {
           $thumbCandidate = $targetThumb;
         }
@@ -2487,6 +2807,25 @@ if ($action) {
         border: 1px solid var(--border-subtle);
         border-radius: 18px;
         padding: 1.8rem;
+      }
+
+      /* Beautified Import Drop Zone */
+      .import-drop-zone {
+        border: 2px dashed var(--border-strong);
+        background: var(--bg-surface-elevated);
+        border-radius: 12px;
+        padding: 1.5rem 1rem;
+        text-align: center;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      .import-drop-zone:hover, .import-drop-zone.dragover {
+        border-color: var(--accent);
+        background: var(--accent-alpha);
       }
 
       @media (max-width: 768px) {
@@ -3062,8 +3401,19 @@ if ($action) {
         display: inline-flex;
         align-items: center;
         gap: 0.35rem;
+        max-width: min(100%, 280px);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
       }
-      .tag-pill svg { width: 13px; height: 13px; }
+      .tag-pill span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+      }
+      .tag-pill svg { width: 13px; height: 13px; flex-shrink: 0; }
       .tag-pill:hover { background: var(--accent-alpha); color: var(--accent); border-color: var(--accent); }
       .tag-pill.special-parody { color: #38bdf8; border-color: rgba(56, 189, 248, 0.25); }
       .tag-pill.special-character { color: #a855f7; border-color: rgba(168, 85, 247, 0.25); }
@@ -5032,6 +5382,10 @@ if ($action) {
                         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92c0-1.61-1.31-2.92-2.92-2.92z"/></svg>
                         <span>Share</span>
                       </button>
+                      <a href="?action=artwork_export&id=${art.id}" class="btn-subtle" style="gap:0.4rem;" download>
+                        <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                        <span>Export Post (.zip)</span>
+                      </a>
                       ${images.length > 1 ? `
                         <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.downloadArtworkZip(${art.id})">
                           <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
@@ -5140,6 +5494,93 @@ if ($action) {
             </div>
           `;
           this.showModal(html);
+        }
+
+        showImportModal() {
+          const html = `
+            <div class="modal-header">
+              <span>Import Post Package</span>
+              <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+            </div>
+            <form onsubmit="app.handleImportSubmit(event)">
+              <div class="modal-body" style="gap:1rem;">
+                <p style="font-size:0.84rem; color:var(--text-secondary); line-height:1.5;">
+                  Select an exported post package (containing <code>info.json</code> and <code>items/</code>) to restore all artwork metadata, multi-page media, and tags.
+                </p>
+
+                <div class="import-drop-zone" id="import-drop-box" onclick="document.getElementById('import-file-elem').click()">
+                  <svg viewBox="0 0 24 24" style="width:36px; height:36px; color:var(--accent);"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+                  <span style="font-weight:700; font-size:0.9rem;">Click to choose or drag &amp; drop file</span>
+                  <span style="font-size:0.75rem; color:var(--text-muted);">Supports .zip packages &amp; .json exports</span>
+                  <input type="file" id="import-file-elem" name="import_file" accept=".zip,.json,application/zip,application/json" style="display:none;" onchange="app.handleImportFileSelect(this)" required>
+                </div>
+
+                <div id="import-file-details" style="display:none; align-items:center; justify-content:space-between; background:var(--bg-surface-elevated); border:1px solid var(--border-subtle); border-radius:10px; padding:0.6rem 0.85rem;">
+                  <div style="display:flex; align-items:center; gap:0.55rem; min-width:0;">
+                    <svg viewBox="0 0 24 24" style="width:18px; height:18px; color:#10b981; flex-shrink:0;"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+                    <span id="import-chosen-name" style="font-weight:600; font-size:0.82rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></span>
+                  </div>
+                  <span id="import-chosen-size" style="font-size:0.75rem; color:var(--text-muted); flex-shrink:0;"></span>
+                </div>
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn-subtle" onclick="app.closeModal()">Cancel</button>
+                <button type="submit" class="btn-primary" id="btn-import-submit">Import Post</button>
+              </div>
+            </form>
+          `;
+          this.showModal(html);
+
+          const dropBox = document.getElementById('import-drop-box');
+          const fileInput = document.getElementById('import-file-elem');
+          if (dropBox && fileInput) {
+            dropBox.ondragover = (e) => { e.preventDefault(); dropBox.classList.add('dragover'); };
+            dropBox.ondragleave = () => dropBox.classList.remove('dragover');
+            dropBox.ondrop = (e) => {
+              e.preventDefault();
+              dropBox.classList.remove('dragover');
+              if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                this.handleImportFileSelect(fileInput);
+              }
+            };
+          }
+        }
+
+        handleImportFileSelect(input) {
+          const file = input.files && input.files[0];
+          const detailsBox = document.getElementById('import-file-details');
+          const nameSpan = document.getElementById('import-chosen-name');
+          const sizeSpan = document.getElementById('import-chosen-size');
+
+          if (file && detailsBox && nameSpan && sizeSpan) {
+            nameSpan.innerText = file.name;
+            const sizeKB = (file.size / 1024).toFixed(1);
+            sizeSpan.innerText = file.size > 1048576 ? `${(file.size / 1048576).toFixed(1)} MB` : `${sizeKB} KB`;
+            detailsBox.style.display = 'flex';
+          }
+        }
+
+        async handleImportSubmit(e) {
+          e.preventDefault();
+          const btn = document.getElementById('btn-import-submit');
+          if (btn) {
+            btn.disabled = true;
+            btn.innerText = 'Importing...';
+          }
+          const fd = new FormData(e.target);
+          try {
+            const res = await this.api('artwork_import', fd, 'POST');
+            this.closeModal();
+            this.toast('Post imported successfully!');
+            this.nav(`#/artwork/${res.artwork_id}`);
+          } catch(err) {
+            this.toast(err.message);
+            if (btn) {
+              btn.disabled = false;
+              btn.innerText = 'Import Post';
+            }
+          }
         }
 
         renderMediaContent(imgObj) {
@@ -5753,9 +6194,16 @@ if ($action) {
           this.uploadQueue = [...(artData.images || [])];
   
           const html = `
-          <div class="studio-card">
-            <h2 style="font-size:1.4rem; font-weight:800; margin-bottom:1.2rem;">${editId ? 'Edit Artwork Studio' : 'Publish Artwork or Video'}</h2>
-  
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.2rem; flex-wrap:wrap; gap:0.6rem;">
+              <h2 style="font-size:1.4rem; font-weight:800; margin:0;">${editId ? 'Edit Artwork Studio' : 'Publish Artwork or Video'}</h2>
+                ${!editId ? `
+                  <button type="button" class="btn-primary" onclick="app.showImportModal()">
+                    <svg viewBox="0 0 24 24" style="width:16px; height:16px;"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+                    <span>Import Post</span>
+                  </button>
+                ` : ''}
+              </div>
+
               <form onsubmit="app.handleArtworkSubmit(event)">
                 <input type="hidden" name="id" value="${artData.id || 0}">
   
