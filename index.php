@@ -235,6 +235,28 @@ function getDB($config) {
         hits INTEGER DEFAULT 1,
         expires_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS encyclopedias (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL,
+        name TEXT NOT NULL,
+        body TEXT DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        updated_by INTEGER DEFAULT 0,
+        UNIQUE(category, name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_encyclopedias_cat_name ON encyclopedias(category, name);
+
+      CREATE TABLE IF NOT EXISTS encyclopedia_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL,
+        name TEXT NOT NULL,
+        body TEXT DEFAULT '',
+        edit_summary TEXT DEFAULT '',
+        user_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_enc_rev_cat_name ON encyclopedia_revisions(category, name, created_at DESC);
     ");
 
     $artCols = $db->query("PRAGMA table_info(artworks)")->fetchAll(PDO::FETCH_COLUMN, 1);
@@ -265,15 +287,29 @@ function jsonResponse($data, $status = 200) {
 }
 
 function getCurrentUser($db) {
-  if (empty($_SESSION['user_id'])) return null;
-  $stmt = $db->prepare("SELECT id, username, artist_name, email_hash, bio, avatar, banner, twitter, website, is_admin, is_banned, created_at FROM users WHERE id = ?");
-  $stmt->execute([(int)$_SESSION['user_id']]);
-  $user = $stmt->fetch() ?: null;
-  if ($user && !empty($user['is_banned'])) {
+  if (session_status() === PHP_SESSION_NONE) {
+    @session_start();
+  }
+
+  $uid = (int)($_SESSION['user_id'] ?? 0);
+  if ($uid <= 0) {
     unset($_SESSION['user_id']);
     return null;
   }
-  return $user;
+
+  try {
+    $stmt = $db->prepare("SELECT id, username, artist_name, email_hash, bio, avatar, banner, twitter, website, is_admin, is_banned, created_at FROM users WHERE id = ?");
+    $stmt->execute([$uid]);
+    $user = $stmt->fetch() ?: null;
+    if (!$user || !empty($user['is_banned'])) {
+      unset($_SESSION['user_id']);
+      return null;
+    }
+    $_SESSION['user_id'] = (int)$user['id'];
+    return $user;
+  } catch (Exception $e) {
+    return null;
+  }
 }
 
 function requireAuth($db) {
@@ -353,6 +389,30 @@ function hashEmail($email) {
   return hash('sha256', strtolower(trim($email)));
 }
 
+function getArtworkThumbnailPath($fileName, $config) {
+  if (empty($fileName)) return '';
+  $osRel = str_replace('/', DIRECTORY_SEPARATOR, $fileName);
+  $candidates = [
+    $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRel . '.jpg',
+    $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRel,
+    $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fileName) . '.jpg',
+    $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . basename($fileName)
+  ];
+  foreach ($candidates as $cand) {
+    if (file_exists($cand) && is_file($cand)) return $cand;
+  }
+  $rawPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $osRel;
+  if (file_exists($rawPath) && is_file($rawPath)) {
+    $targetThumb = $config['thumb_dir'] . DIRECTORY_SEPARATOR . $osRel . '.jpg';
+    if (!is_dir(dirname($targetThumb))) @mkdir(dirname($targetThumb), 0755, true);
+    if (createThumbnail($rawPath, $targetThumb, $config['thumb_width'], $config['thumb_quality'])) {
+      return $targetThumb;
+    }
+    return $rawPath;
+  }
+  return '';
+}
+
 function compute_phash($path) {
   if (!file_exists($path)) return '';
   $info = @getimagesize($path);
@@ -368,29 +428,30 @@ function compute_phash($path) {
     case 'image/bmp':  $src = function_exists('imagecreatefrombmp') ? @imagecreatefrombmp($path) : null; break;
   }
   if (!$src) return '';
-  $small = imagecreatetruecolor(8, 8);
-  imagecopyresampled($small, $src, 0, 0, 0, 0, 8, 8, imagesx($src), imagesy($src));
+
+  // Difference Hash (dHash): 9x8 matrix tracking horizontal gradients
+  $small = imagecreatetruecolor(9, 8);
+  imagecopyresampled($small, $src, 0, 0, 0, 0, 9, 8, imagesx($src), imagesy($src));
   imagedestroy($src);
-  $grays = [];
-  $total = 0;
+
+  $hash = '';
   for ($y = 0; $y < 8; $y++) {
-    for ($x = 0; $x < 8; $x++) {
+    $rowGrays = [];
+    for ($x = 0; $x < 9; $x++) {
       $rgb = imagecolorat($small, $x, $y);
-      $gray = (int)((($rgb >> 16 & 0xFF) * 0.299) + (($rgb >> 8 & 0xFF) * 0.587) + (($rgb & 0xFF) * 0.114));
-      $grays[] = $gray;
-      $total += $gray;
+      $rowGrays[] = (int)((($rgb >> 16 & 0xFF) * 0.299) + (($rgb >> 8 & 0xFF) * 0.587) + (($rgb & 0xFF) * 0.114));
+    }
+    for ($x = 0; $x < 8; $x++) {
+      $hash .= ($rowGrays[$x + 1] > $rowGrays[$x]) ? '1' : '0';
     }
   }
   imagedestroy($small);
-  $avg = $total / 64;
-  $hash = '';
-  foreach ($grays as $g) {
-    $hash .= ($g >= $avg) ? '1' : '0';
-  }
-  return $hash;
+  return 'd:' . $hash;
 }
 
 function hamming_distance($h1, $h2) {
+  if (is_string($h1) && strpos($h1, 'd:') === 0) $h1 = substr($h1, 2);
+  if (is_string($h2) && strpos($h2, 'd:') === 0) $h2 = substr($h2, 2);
   if (strlen($h1) !== 64 || strlen($h2) !== 64) return 64;
   $dist = 0;
   for ($i = 0; $i < 64; $i++) {
@@ -630,15 +691,26 @@ SVG;
 
 if ($action) {
   if ($action === 'check_url') {
-    $url = trim($_GET['url'] ?? '');
-    if ($url === '' || filter_var($url, FILTER_VALIDATE_URL) === false) {
-      jsonResponse(['valid' => false, 'duplicate' => null]);
+    $rawUrls = trim($_GET['url'] ?? '');
+    $urls = preg_split('/[\r\n,\s]+/u', $rawUrls, -1, PREG_SPLIT_NO_EMPTY);
+    $dup = null;
+    $hasValid = false;
+
+    foreach ($urls as $u) {
+      if (filter_var($u, FILTER_VALIDATE_URL) && preg_match('#^https?://#i', $u)) {
+        $hasValid = true;
+        $stmt = $db->prepare("SELECT id, title FROM artworks WHERE source_url LIKE ? LIMIT 1");
+        $stmt->execute(['%' . $u . '%']);
+        $found = $stmt->fetch();
+        if ($found) {
+          $dup = $found;
+          break;
+        }
+      }
     }
-    $stmt = $db->prepare("SELECT id, title FROM artworks WHERE source_url = ? AND source_url != '' LIMIT 1");
-    $stmt->execute([$url]);
-    $dup = $stmt->fetch();
+
     jsonResponse([
-      'valid'     => true,
+      'valid'     => $hasValid,
       'duplicate' => $dup ?: null
     ]);
   }
@@ -1036,15 +1108,31 @@ if ($action) {
     $rating = in_array($_POST['rating'] ?? '', ['all', 'r18']) ? $_POST['rating'] : 'all';
     $isAi = !empty($_POST['is_ai']) ? 1 : 0;
     $isOriginal = isset($_POST['is_original']) ? (!empty($_POST['is_original']) ? 1 : 0) : 1;
-    $tools = trim($_POST['tools'] ?? '');
-    $parodies = trim($_POST['parodies'] ?? '');
-    $characters = trim($_POST['characters'] ?? '');
-    $sourceUrl = trim($_POST['source_url'] ?? '');
-    if ($sourceUrl !== '') {
-      if (!filter_var($sourceUrl, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $sourceUrl)) {
-        jsonResponse(['error' => 'Invalid source URL. Only HTTP and HTTPS URLs are permitted.'], 400);
+    // Separate by comma only (never by space)
+    $cleanCommaList = function($str) {
+      $parts = preg_split('/[,，、]+/u', $str, -1, PREG_SPLIT_NO_EMPTY);
+      return implode(', ', array_unique(array_filter(array_map('trim', $parts))));
+    };
+
+    $tools = $cleanCommaList($_POST['tools'] ?? '');
+    $parodies = $cleanCommaList($_POST['parodies'] ?? '');
+    $characters = $cleanCommaList($_POST['characters'] ?? '');
+
+    // Allow multiple original source URLs (validated per line or comma)
+    $rawSourceUrls = trim($_POST['source_url'] ?? '');
+    $cleanSourceUrls = [];
+    if ($rawSourceUrls !== '') {
+      $urlCandidates = preg_split('/[\r\n,\s]+/u', $rawSourceUrls, -1, PREG_SPLIT_NO_EMPTY);
+      foreach ($urlCandidates as $u) {
+        $u = trim($u);
+        if ($u === '') continue;
+        if (!filter_var($u, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $u)) {
+          jsonResponse(['error' => "Invalid source URL '{$u}'. Only valid HTTP and HTTPS URLs are permitted."], 400);
+        }
+        $cleanSourceUrls[] = $u;
       }
     }
+    $sourceUrl = implode("\n", array_unique($cleanSourceUrls));
     $rawTags = trim($_POST['tags'] ?? '');
     $postMode = trim($_POST['post_mode'] ?? 'single');
     $imagesJson = $_POST['images'] ?? '[]';
@@ -1062,10 +1150,9 @@ if ($action) {
       jsonResponse(['error' => 'Maximum upload limit is 500 images per post.'], 400);
     }
 
-    // Rule 2: Maximum 10 images/day for separate individual posts
+    // Rule 2: Maximum 10 images/day for separate individual posts (bypassed for Admins)
     $isSeparateIndividual = ($postMode === 'batch' && count($images) > 1) || count($images) === 1;
-    if ($artworkId === 0 && $isSeparateIndividual) {
-      $newIndividualCount = ($postMode === 'batch') ? count($images) : 1;
+    if (empty($user['is_admin']) && $artworkId === 0 && $isSeparateIndividual) {
       $since24h = time() - 86400;
 
       $stmtDaily = $db->prepare("
@@ -1076,10 +1163,9 @@ if ($action) {
       $stmtDaily->execute([$user['id'], $since24h]);
       $dailyIndividualCount = (int)$stmtDaily->fetchColumn();
 
-      if (($dailyIndividualCount + $newIndividualCount) > 10) {
-        $remaining = max(0, 10 - $dailyIndividualCount);
+      if ($dailyIndividualCount >= 10) {
         jsonResponse([
-          'error' => "Daily limit reached for separate individual posts (max 10 images/day). You have published {$dailyIndividualCount}/10 in the last 24 hours (remaining: {$remaining})."
+          'error' => "Daily limit reached for separate individual posts (10/10 published in the last 24 hours). Please wait for the daily reset or publish as a single multi-page post."
         ], 429);
       }
     }
@@ -1087,7 +1173,7 @@ if ($action) {
     $db->beginTransaction();
     try {
       $now = time();
-      $tagsArray = array_values(array_unique(array_filter(array_map('trim', preg_split('/[,#、\s]+/u', $rawTags)))));
+      $tagsArray = array_values(array_unique(array_filter(array_map('trim', preg_split('/[,，、]+/u', $rawTags)))));
       $cleanTagsStr = implode(', ', $tagsArray);
 
       if ($artworkId === 0 && $postMode === 'batch' && count($images) > 1) {
@@ -1450,55 +1536,128 @@ if ($action) {
 
   if ($action === 'similar_search') {
     $sourceId = intval($_GET['source_id'] ?? ($_POST['source_id'] ?? 0));
+    $imageId = intval($_GET['image_id'] ?? ($_POST['image_id'] ?? 0));
+    $sortOrder = isset($_GET['sort_order']) ? intval($_GET['sort_order']) : (isset($_GET['image_index']) ? intval($_GET['image_index']) : -1);
     $targetHash = '';
     $sourceArt = null;
+    $targetImage = null;
 
     if ($sourceId > 0) {
-      $st = $db->prepare("SELECT a.*, (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file FROM artworks a WHERE a.id = ?");
+      $st = $db->prepare("SELECT a.* FROM artworks a WHERE a.id = ?");
       $st->execute([$sourceId]);
       $sourceArt = $st->fetch();
+
       if ($sourceArt) {
-        $targetHash = $sourceArt['phash'];
-        if (empty($targetHash) && !empty($sourceArt['cover_file'])) {
-          $tPath = $config['thumb_dir'] . DIRECTORY_SEPARATOR . 'thumb_' . $sourceArt['cover_file'] . '.jpg';
-          if (!file_exists($tPath)) $tPath = $config['upload_dir'] . DIRECTORY_SEPARATOR . $sourceArt['cover_file'];
+        $imgsSt = $db->prepare("
+          SELECT id, file_name, sort_order, mime_type, phash
+          FROM artwork_images
+          WHERE artwork_id = ?
+          ORDER BY sort_order ASC, id ASC
+        ");
+        $imgsSt->execute([$sourceId]);
+        $rawImgs = $imgsSt->fetchAll();
+        $imagePages = array_values(array_filter($rawImgs, function($im) {
+          return empty($im['mime_type']) || strpos($im['mime_type'], 'video/') !== 0;
+        }));
+
+        if (empty($imagePages)) {
+          jsonResponse(['error' => 'Visual similarity search is only available for images.'], 400);
+        }
+
+        if ($imageId > 0) {
+          foreach ($imagePages as $im) {
+            if ((int)$im['id'] === $imageId) { $targetImage = $im; break; }
+          }
+        } elseif ($sortOrder >= 0 && isset($imagePages[$sortOrder])) {
+          $targetImage = $imagePages[$sortOrder];
+        }
+
+        if (!$targetImage) {
+          $targetImage = $imagePages[0];
+        }
+
+        $sourceArt['cover_file'] = $targetImage['file_name'];
+        $sourceArt['selected_sort_order'] = (int)$targetImage['sort_order'];
+        $sourceArt['selected_image_id'] = (int)$targetImage['id'];
+        $sourceArt['all_images'] = $imagePages;
+
+        $tPath = getArtworkThumbnailPath($targetImage['file_name'], $config);
+        if ($tPath) {
           $targetHash = compute_phash($tPath);
           if ($targetHash) {
-            $db->prepare("UPDATE artworks SET phash = ? WHERE id = ?")->execute([$targetHash, $sourceId]);
+            $db->prepare("UPDATE artwork_images SET phash = ? WHERE id = ?")->execute([$targetHash, $targetImage['id']]);
+            if ((int)$targetImage['sort_order'] === 0) {
+              $db->prepare("UPDATE artworks SET phash = ? WHERE id = ?")->execute([$targetHash, $sourceId]);
+            }
           }
         }
       }
     } elseif (isset($_FILES['similar_file']) && $_FILES['similar_file']['error'] === 0) {
-      $targetHash = compute_phash($_FILES['similar_file']['tmp_name']);
-    }
-
-    if (empty($targetHash)) {
-      jsonResponse(['error' => 'Could not compute visual perceptual hash for target image.'], 400);
-    }
-
-    $all = $db->query("
-      SELECT a.id, a.title, a.type, a.rating, a.phash,
-        (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file,
-        (SELECT COUNT(*) FROM artwork_images WHERE artwork_id = a.id) as page_count,
-        u.artist_name, u.username
-      FROM artworks a
-      JOIN users u ON a.user_id = u.id
-      WHERE a.phash IS NOT NULL AND a.phash != ''
-    ")->fetchAll();
-
-    $results = [];
-    foreach ($all as $item) {
-      if ($sourceArt && $item['id'] == $sourceArt['id']) continue;
-      $dist = hamming_distance($targetHash, $item['phash']);
-      if ($dist <= 18) {
-        $similarity = round((1 - ($dist / 64)) * 100, 1);
-        $item['distance'] = $dist;
-        $item['similarity'] = $similarity;
-        $results[] = $item;
+      $tmpUpload = $_FILES['similar_file']['tmp_name'];
+      $tempThumb = $config['chunk_dir'] . DIRECTORY_SEPARATOR . 'sim_tmp_' . bin2hex(random_bytes(6)) . '.jpg';
+      if (createThumbnail($tmpUpload, $tempThumb, $config['thumb_width'], $config['thumb_quality'])) {
+        $targetHash = compute_phash($tempThumb);
+        @unlink($tempThumb);
+      } else {
+        $targetHash = compute_phash($tmpUpload);
       }
     }
 
+    if (empty($targetHash)) {
+      jsonResponse(['error' => 'Could not compute visual perceptual hash for target thumbnail.'], 400);
+    }
+
+    $allImages = $db->query("
+      SELECT ai.id as image_id, ai.artwork_id, ai.file_name, ai.sort_order, ai.phash,
+             a.id as art_id, a.title, a.type, a.rating, u.artist_name, u.username
+      FROM artwork_images ai
+      JOIN artworks a ON ai.artwork_id = a.id
+      JOIN users u ON a.user_id = u.id
+      WHERE a.type != 'video' AND (ai.mime_type IS NULL OR ai.mime_type NOT LIKE 'video/%')
+    ")->fetchAll();
+
+    $matchedPosts = [];
+    foreach ($allImages as $item) {
+      $artId = (int)($item['artwork_id'] ?? $item['art_id']);
+      if ($sourceId > 0 && $artId === $sourceId) continue;
+
+      $imgHash = $item['phash'] ?? '';
+      if (empty($imgHash) || strpos($imgHash, 'd:') !== 0 || strlen($imgHash) !== 66) {
+        $tPath = getArtworkThumbnailPath($item['file_name'], $config);
+        if ($tPath) {
+          $imgHash = compute_phash($tPath);
+          if ($imgHash) {
+            $db->prepare("UPDATE artwork_images SET phash = ? WHERE id = ?")->execute([$imgHash, $item['image_id']]);
+            if ((int)$item['sort_order'] === 0) {
+              $db->prepare("UPDATE artworks SET phash = ? WHERE id = ?")->execute([$imgHash, $artId]);
+            }
+          }
+        }
+      }
+
+      if (empty($imgHash) || strpos($imgHash, 'd:') !== 0) continue;
+
+      $dist = hamming_distance($targetHash, $imgHash);
+      if ($dist <= 14) {
+        $similarity = round((1 - ($dist / 64)) * 100, 1);
+        if (!isset($matchedPosts[$artId]) || $dist < $matchedPosts[$artId]['distance']) {
+          $matchedPosts[$artId] = [
+            'id'          => $artId,
+            'title'       => $item['title'],
+            'type'        => $item['type'],
+            'rating'      => $item['rating'],
+            'cover_file'  => $item['file_name'],
+            'artist_name' => $item['artist_name'],
+            'distance'    => $dist,
+            'similarity'  => $similarity
+          ];
+        }
+      }
+    }
+
+    $results = array_values($matchedPosts);
     usort($results, fn($a, $b) => $a['distance'] <=> $b['distance']);
+
     jsonResponse([
       'target_hash' => $targetHash,
       'source_art'  => $sourceArt,
@@ -1632,15 +1791,26 @@ if ($action) {
   }
 
   if ($action === 'artwork_export') {
+    $user = requireAuth($db);
     $artworkId = intval($_GET['id'] ?? 0);
     $stmt = $db->prepare("SELECT * FROM artworks WHERE id = ?");
     $stmt->execute([$artworkId]);
     $art = $stmt->fetch();
     if (!$art) jsonResponse(['error' => 'Artwork not found.'], 404);
 
+    // Security check: Only post owner or administrators can export full raw packages
+    if ((int)$art['user_id'] !== (int)$user['id'] && empty($user['is_admin'])) {
+      jsonResponse(['error' => 'Access denied: Only the author or an admin can export this package.'], 403);
+    }
+
     if (!class_exists('ZipArchive')) {
       jsonResponse(['error' => 'Server ZipArchive extension is required.'], 500);
     }
+
+    // Prevent server execution timeouts during large package compilation
+    @set_time_limit(0);
+    @ini_set('max_execution_time', '0');
+    if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
 
     $stmtImgs = $db->prepare("SELECT * FROM artwork_images WHERE artwork_id = ? ORDER BY sort_order ASC, id ASC");
     $stmtImgs->execute([$artworkId]);
@@ -2096,46 +2266,274 @@ if ($action) {
 
   if ($action === 'tags_all') {
     $stmt = $db->query("
-      SELECT tag_name, COUNT(*) as tag_count
-      FROM tags
-      GROUP BY tag_name
-      ORDER BY tag_name ASC
+      SELECT t.tag_name, COUNT(DISTINCT t.artwork_id) as tag_count,
+        (SELECT ai.file_name FROM artwork_images ai 
+         JOIN artworks a ON a.id = ai.artwork_id 
+         JOIN tags t2 ON t2.artwork_id = a.id 
+         WHERE t2.tag_name = t.tag_name 
+         ORDER BY a.created_at DESC, ai.sort_order ASC LIMIT 1) as cover_file
+      FROM tags t
+      GROUP BY t.tag_name
+      ORDER BY tag_count DESC, t.tag_name ASC
     ");
     jsonResponse(['tags' => $stmt->fetchAll()]);
   }
 
+  if ($action === 'encyclopedia_captcha') {
+    if (session_status() === PHP_SESSION_NONE) @session_start();
+    $num1 = mt_rand(4, 25);
+    $num2 = mt_rand(1, 15);
+    $ops = ['+', '-'];
+    $op = $ops[array_rand($ops)];
+    if ($op === '-' && $num2 > $num1) {
+      $t = $num1; $num1 = $num2; $num2 = $t;
+    }
+    $ans = ($op === '+') ? ($num1 + $num2) : ($num1 - $num2);
+    $_SESSION['enc_captcha'] = (string)$ans;
+
+    $lines = '';
+    for ($i = 0; $i < 3; $i++) {
+      $x1 = mt_rand(0, 140); $y1 = mt_rand(0, 38);
+      $x2 = mt_rand(0, 140); $y2 = mt_rand(0, 38);
+      $lines .= "<line x1='{$x1}' y1='{$y1}' x2='{$x2}' y2='{$y2}' stroke='rgba(255,255,255,0.1)' stroke-width='1.5'/>";
+    }
+
+    $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="140" height="38" viewBox="0 0 140 38">
+      <rect width="100%" height="100%" fill="#14141a" rx="8"/>
+      ' . $lines . '
+      <text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-family="monospace" font-size="18" font-weight="800" fill="#0096fa" letter-spacing="2">' . $num1 . ' ' . $op . ' ' . $num2 . ' = ?</text>
+    </svg>';
+
+    header('Content-Type: image/svg+xml');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    echo $svg;
+    exit;
+  }
+
+  if ($action === 'encyclopedia_get') {
+    $category = trim($_GET['category'] ?? '');
+    $name = trim($_GET['name'] ?? '');
+    if (!in_array($category, ['tag', 'character', 'parody']) || $name === '') {
+      jsonResponse(['error' => 'Invalid category or name.'], 400);
+    }
+
+    $stmt = $db->prepare("
+      SELECT e.*, u.artist_name as editor_name,
+        (SELECT COUNT(*) FROM encyclopedia_revisions WHERE category = e.category AND name = e.name) as revision_count
+      FROM encyclopedias e
+      LEFT JOIN users u ON e.updated_by = u.id
+      WHERE e.category = ? AND e.name = ?
+    ");
+    $stmt->execute([$category, $name]);
+    $entry = $stmt->fetch();
+
+    if (!$entry) {
+      $entry = [
+        'id'             => 0,
+        'category'       => $category,
+        'name'           => $name,
+        'body'           => '',
+        'updated_at'     => 0,
+        'updated_by'     => 0,
+        'editor_name'    => '',
+        'revision_count' => 0
+      ];
+    } else {
+      $entry['revision_count'] = max(1, (int)$entry['revision_count']);
+    }
+
+    // Resolve most viewed 1:1 image representation (Like Pixiv Encyclopedia)
+    $topArt = null;
+    if ($category === 'tag') {
+      $stTop = $db->prepare("
+        SELECT a.id, a.title, a.view_count,
+          (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file
+        FROM artworks a
+        JOIN tags t ON t.artwork_id = a.id
+        WHERE t.tag_name = ? AND a.type != 'video'
+        ORDER BY a.view_count DESC, a.like_count DESC, a.created_at DESC
+        LIMIT 1
+      ");
+      $stTop->execute([$name]);
+      $topArt = $stTop->fetch();
+    } elseif ($category === 'character') {
+      $stTop = $db->prepare("
+        SELECT a.id, a.title, a.view_count,
+          (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file
+        FROM artworks a
+        WHERE a.characters LIKE ? AND a.type != 'video'
+        ORDER BY a.view_count DESC, a.like_count DESC, a.created_at DESC
+        LIMIT 1
+      ");
+      $stTop->execute(['%' . $name . '%']);
+      $topArt = $stTop->fetch();
+    } elseif ($category === 'parody') {
+      $stTop = $db->prepare("
+        SELECT a.id, a.title, a.view_count,
+          (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file
+        FROM artworks a
+        WHERE a.parodies LIKE ? AND a.type != 'video'
+        ORDER BY a.view_count DESC, a.like_count DESC, a.created_at DESC
+        LIMIT 1
+      ");
+      $stTop->execute(['%' . $name . '%']);
+      $topArt = $stTop->fetch();
+    }
+
+    $entry['top_artwork_id'] = $topArt ? (int)$topArt['id'] : 0;
+    $entry['top_artwork_title'] = $topArt ? $topArt['title'] : '';
+    $entry['top_artwork_views'] = $topArt ? (int)$topArt['view_count'] : 0;
+    $entry['top_artwork_cover'] = $topArt ? $topArt['cover_file'] : '';
+
+    jsonResponse($entry);
+  }
+
+  if ($action === 'encyclopedia_save') {
+    verifyCsrfToken();
+    $user = requireAuth($db);
+
+    $captchaInput = trim($_POST['captcha'] ?? '');
+    $expectedCaptcha = $_SESSION['enc_captcha'] ?? '';
+    unset($_SESSION['enc_captcha']);
+
+    if ($expectedCaptcha === '' || $captchaInput !== $expectedCaptcha) {
+      jsonResponse(['error' => 'Incorrect security captcha. Please solve the calculation and try again.'], 400);
+    }
+
+    // Limit: 10 encyclopedia edits per 24 hours (Bypassed for Admins)
+    if (empty($user['is_admin'])) {
+      $since24h = time() - 86400;
+      $stmtEdits = $db->prepare("
+        SELECT COUNT(*) FROM encyclopedia_revisions
+        WHERE user_id = ? AND created_at >= ?
+      ");
+      $stmtEdits->execute([$user['id'], $since24h]);
+      $dailyEditCount = (int)$stmtEdits->fetchColumn();
+
+      if ($dailyEditCount >= 10) {
+        jsonResponse([
+          'error' => "Daily limit reached: You can edit the encyclopedia up to 10 times per 24 hours ({$dailyEditCount}/10 used). Please try again later."
+        ], 429);
+      }
+    }
+
+    $category = trim($_POST['category'] ?? '');
+    $name = trim($_POST['name'] ?? '');
+    $body = trim($_POST['body'] ?? '');
+    $summary = mb_substr(trim($_POST['edit_summary'] ?? ''), 0, 255);
+    if ($summary === '') $summary = 'Updated article content';
+
+    if (!in_array($category, ['tag', 'character', 'parody']) || $name === '') {
+      jsonResponse(['error' => 'Invalid category or name.'], 400);
+    }
+
+    $now = time();
+    $stmt = $db->prepare("
+      REPLACE INTO encyclopedias (category, name, body, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?)
+    ");
+    $stmt->execute([$category, $name, $body, $now, $user['id']]);
+
+    $revStmt = $db->prepare("
+      INSERT INTO encyclopedia_revisions (category, name, body, edit_summary, user_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    ");
+    $revStmt->execute([$category, $name, $body, $summary, $user['id'], $now]);
+
+    logActivity($db, $user['id'], 'encyclopedia_edit', 0, "Edited {$category} encyclopedia: {$name}");
+    jsonResponse([
+      'success'     => true,
+      'category'    => $category,
+      'name'        => $name,
+      'body'        => $body,
+      'updated_at'  => $now,
+      'editor_name' => $user['artist_name']
+    ]);
+  }
+
+  if ($action === 'encyclopedia_history') {
+    $category = trim($_GET['category'] ?? '');
+    $name = trim($_GET['name'] ?? '');
+    if (!in_array($category, ['tag', 'character', 'parody']) || $name === '') {
+      jsonResponse(['error' => 'Invalid category or name.'], 400);
+    }
+
+    $stmt = $db->prepare("
+      SELECT r.id, r.edit_summary, r.created_at, u.id as user_id, u.artist_name as editor_name
+      FROM encyclopedia_revisions r
+      LEFT JOIN users u ON r.user_id = u.id
+      WHERE r.category = ? AND r.name = ?
+      ORDER BY r.created_at DESC
+      LIMIT 30
+    ");
+    $stmt->execute([$category, $name]);
+    $history = $stmt->fetchAll();
+
+    jsonResponse([
+      'category' => $category,
+      'name'     => $name,
+      'history'  => $history ?: []
+    ]);
+  }
+
   if ($action === 'characters_all') {
-    $rows = $db->query("SELECT characters FROM artworks WHERE characters != ''")->fetchAll(PDO::FETCH_COLUMN);
+    $rows = $db->query("
+      SELECT a.id, a.characters, a.created_at,
+        (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC LIMIT 1) as cover_file
+      FROM artworks a
+      WHERE a.characters != ''
+      ORDER BY a.created_at DESC
+    ")->fetchAll();
+
     $counts = [];
+    $covers = [];
     foreach ($rows as $r) {
-      $items = preg_split('/[,、\s]+/u', $r, -1, PREG_SPLIT_NO_EMPTY);
+      $items = preg_split('/[,，、]+/u', $r['characters'], -1, PREG_SPLIT_NO_EMPTY);
       foreach ($items as $item) {
         $t = trim($item);
-        if ($t !== '') $counts[$t] = ($counts[$t] ?? 0) + 1;
+        if ($t !== '') {
+          $counts[$t] = ($counts[$t] ?? 0) + 1;
+          if (empty($covers[$t]) && !empty($r['cover_file'])) {
+            $covers[$t] = $r['cover_file'];
+          }
+        }
       }
     }
     arsort($counts);
     $list = [];
     foreach ($counts as $name => $count) {
-      $list[] = ['name' => $name, 'count' => $count];
+      $list[] = ['name' => $name, 'count' => $count, 'cover_file' => $covers[$name] ?? ''];
     }
     jsonResponse(['characters' => $list]);
   }
 
   if ($action === 'series_all') {
-    $rows = $db->query("SELECT parodies FROM artworks WHERE parodies != ''")->fetchAll(PDO::FETCH_COLUMN);
+    $rows = $db->query("
+      SELECT a.id, a.parodies, a.created_at,
+        (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC LIMIT 1) as cover_file
+      FROM artworks a
+      WHERE a.parodies != ''
+      ORDER BY a.created_at DESC
+    ")->fetchAll();
+
     $counts = [];
+    $covers = [];
     foreach ($rows as $r) {
-      $items = preg_split('/[,、\s]+/u', $r, -1, PREG_SPLIT_NO_EMPTY);
+      $items = preg_split('/[,，、]+/u', $r['parodies'], -1, PREG_SPLIT_NO_EMPTY);
       foreach ($items as $item) {
         $t = trim($item);
-        if ($t !== '') $counts[$t] = ($counts[$t] ?? 0) + 1;
+        if ($t !== '') {
+          $counts[$t] = ($counts[$t] ?? 0) + 1;
+          if (empty($covers[$t]) && !empty($r['cover_file'])) {
+            $covers[$t] = $r['cover_file'];
+          }
+        }
       }
     }
     arsort($counts);
     $list = [];
     foreach ($counts as $name => $count) {
-      $list[] = ['name' => $name, 'count' => $count];
+      $list[] = ['name' => $name, 'count' => $count, 'cover_file' => $covers[$name] ?? ''];
     }
     jsonResponse(['series' => $list]);
   }
@@ -3020,6 +3418,175 @@ if ($action) {
       .badge-flag.video { background: var(--video); }
       .badge-flag.manga { background: #f97316; }
 
+      /* Encyclopedia Components with 1:1 Preview */
+      .encyclopedia-card {
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 14px;
+        padding: 1.2rem 1.4rem;
+        margin-bottom: 1.4rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        box-shadow: var(--shadow-sm);
+      }
+      .encyclopedia-main-row {
+        display: flex;
+        gap: 1.2rem;
+        align-items: flex-start;
+      }
+      .encyclopedia-preview-thumb {
+        width: 120px;
+        height: 120px;
+        aspect-ratio: 1 / 1;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #08080a;
+        border: 1px solid var(--border-subtle);
+        position: relative;
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+      }
+      .encyclopedia-preview-thumb:hover {
+        transform: translateY(-2px);
+        border-color: var(--accent);
+        box-shadow: var(--shadow-md);
+      }
+      .encyclopedia-preview-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        transition: transform 0.3s ease;
+      }
+      .encyclopedia-preview-thumb:hover img {
+        transform: scale(1.06);
+      }
+      .encyclopedia-preview-badge {
+        position: absolute;
+        bottom: 4px;
+        left: 4px;
+        right: 4px;
+        background: rgba(0, 0, 0, 0.75);
+        backdrop-filter: blur(4px);
+        color: #ffffff;
+        font-size: 0.64rem;
+        font-weight: 800;
+        padding: 2px 4px;
+        border-radius: 4px;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      @media (max-width: 680px) {
+        .encyclopedia-main-row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .encyclopedia-preview-thumb {
+          width: 100%;
+          max-width: 140px;
+          height: auto;
+          margin: 0 auto;
+        }
+      }
+      .encyclopedia-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-size: 0.72rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 0.2rem 0.6rem;
+        border-radius: 6px;
+      }
+      .encyclopedia-badge.tag { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+      .encyclopedia-badge.character { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
+      .encyclopedia-badge.parody { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+      .encyclopedia-body {
+        font-size: 0.9rem;
+        line-height: 1.65;
+        color: var(--text-primary);
+      }
+      .encyclopedia-body p { margin-bottom: 0.6rem; }
+      .encyclopedia-body p:last-child { margin-bottom: 0; }
+      .encyclopedia-meta {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      /* Directory Visual Cards with Background Art */
+      .directory-card-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 1rem;
+      }
+      .dir-bg-card {
+        position: relative;
+        height: 110px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-surface-elevated);
+        cursor: pointer;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        padding: 0.85rem;
+        transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+      }
+      .dir-bg-card:hover {
+        transform: translateY(-3px);
+        border-color: var(--accent);
+        box-shadow: var(--shadow-md);
+      }
+      .dir-bg-img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        filter: brightness(0.45);
+        transition: transform 0.3s ease, filter 0.3s ease;
+      }
+      .dir-bg-card:hover .dir-bg-img {
+        transform: scale(1.06);
+        filter: brightness(0.6);
+      }
+      .dir-bg-overlay {
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(180deg, rgba(0,0,0,0.1) 0%, rgba(0,0,0,0.85) 100%);
+        pointer-events: none;
+      }
+      .dir-bg-info {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        gap: 0.15rem;
+      }
+      .dir-bg-title {
+        font-weight: 800;
+        font-size: 0.95rem;
+        color: #ffffff;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+      }
+      .dir-bg-count {
+        font-size: 0.75rem;
+        color: rgba(255, 255, 255, 0.7);
+        font-weight: 600;
+      }
+
       /* Manga Series Component */
       .manga-series-card {
         background: var(--bg-surface);
@@ -3808,10 +4375,7 @@ if ($action) {
   
         <div id="admin-nav-slot"></div>
   
-        <div class="nav-divider"></div>
-        <div class="nav-heading">Popular Tags</div>
-        <div id="sidebar-popular-tags" style="display:flex; flex-direction:column; gap:2px;"></div>
-      </aside>
+        </aside>
   
       <main class="main-viewport" id="viewport">
         <div class="page-container" id="page-container"></div>
@@ -3839,9 +4403,6 @@ if ($action) {
           this.initTheme();
           this.bindEvents();
           this.renderUserSlot();
-          if (!this.needsSetup) {
-            this.loadSidebarTags();
-          }
 
           window.addEventListener('hashchange', () => this.handleRoute());
           this.handleRoute();
@@ -4379,6 +4940,14 @@ if ($action) {
               </div>
             `;
 
+            const encCategory = tag ? 'tag' : (character ? 'character' : (parody ? 'parody' : null));
+            const encName = tag || character || parody || null;
+
+            if (encCategory && encName) {
+              html += `<div id="feed-encyclopedia-slot" style="margin-bottom:1.4rem;"><div class="spinner" style="margin:1rem auto; width:26px; height:26px;"></div></div>`;
+              setTimeout(() => this.loadFeedEncyclopedia(encCategory, encName), 20);
+            }
+
             if (!res.artworks || !res.artworks.length) {
               html += `<div class="center-msg">No illustrations or videos found for this criteria.</div>`;
             } else {
@@ -4458,6 +5027,385 @@ if ($action) {
           }
         }
   
+        async loadFeedEncyclopedia(category, name) {
+          const slot = document.getElementById('feed-encyclopedia-slot');
+          if (!slot) return;
+          try {
+            const res = await this.api('encyclopedia_get', { category, name });
+            let parsedHtml = '';
+            if (res.body) {
+              try {
+                if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+                  parsedHtml = DOMPurify.sanitize(marked.parse(res.body));
+                } else {
+                  parsedHtml = this.escape(res.body).replace(/\n/g, '<br>');
+                }
+              } catch(e) {
+                parsedHtml = this.escape(res.body).replace(/\n/g, '<br>');
+              }
+            }
+
+            const catLabels = { tag: 'Tag Encyclopedia', character: 'Character Lore', parody: 'Series Lore' };
+            const label = catLabels[category] || 'Encyclopedia';
+            const revCount = Number(res.revision_count || (res.body ? 1 : 0));
+            const topThumbUrl = res.top_artwork_cover ? `?action=thumb&f=${encodeURIComponent(res.top_artwork_cover)}` : '';
+
+            slot.innerHTML = `
+              <div class="encyclopedia-card">
+                <div class="encyclopedia-header">
+                  <div style="display:flex; align-items:center; gap:0.6rem; flex-wrap:wrap;">
+                    <span class="encyclopedia-badge ${category}">${label}</span>
+                    <h2 style="font-size:1.15rem; font-weight:800; margin:0;">${this.escape(name)}</h2>
+                    <span style="font-size:0.75rem; color:var(--text-muted); background:var(--bg-surface-elevated); padding:0.15rem 0.5rem; border-radius:4px; font-weight:600;">
+                      Pixiv-style Community Wiki
+                    </span>
+                  </div>
+                  <div style="display:flex; gap:0.4rem; align-items:center;">
+                    ${revCount > 0 ? `
+                      <button type="button" class="btn-subtle" style="height:30px; font-size:0.75rem; gap:0.3rem;" onclick="app.openEncyclopediaHistoryModal('${category}', '${this.escape(name)}')" title="View edit history">
+                        <svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+                        <span>History (${revCount})</span>
+                      </button>
+                    ` : ''}
+                    <button type="button" class="btn-primary" style="height:30px; font-size:0.75rem; gap:0.35rem;" onclick="app.openEncyclopediaEditModal('${category}', '${this.escape(name)}')">
+                      <svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+                      <span>${res.body ? 'Edit Article' : 'Write Article'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="encyclopedia-main-row">
+                  ${res.top_artwork_id > 0 && topThumbUrl ? `
+                    <div class="encyclopedia-preview-thumb" onclick="app.nav('#/artwork/${res.top_artwork_id}')" title="Most Viewed Post: ${this.escape(res.top_artwork_title)} (${res.top_artwork_views.toLocaleString()} views) - Click to view">
+                      <img src="${topThumbUrl}" alt="${this.escape(res.top_artwork_title)}" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(res.top_artwork_cover)}'">
+                      <div class="encyclopedia-preview-badge">&#9733; ${(res.top_artwork_views || 0).toLocaleString()} views</div>
+                    </div>
+                  ` : ''}
+
+                  <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:0.6rem;">
+                    ${res.body ? `
+                      <div class="encyclopedia-body">${parsedHtml}</div>
+                    ` : `
+                      <div style="font-size:0.84rem; color:var(--text-muted); line-height:1.5;">
+                        No wiki article has been written for "${this.escape(name)}" yet. Anyone with an account can write and edit lore freely!
+                      </div>
+                    `}
+                  </div>
+                </div>
+
+                <div class="encyclopedia-meta" style="justify-content:space-between; flex-wrap:wrap; gap:0.4rem; border-top:1px solid var(--border-subtle); padding-top:0.6rem; margin-top:0.2rem;">
+                  <div>
+                    ${res.editor_name ? `<span>Last edited by <strong>${this.escape(res.editor_name)}</strong></span> &bull; ` : ''}
+                    <span>${res.updated_at ? new Date(res.updated_at * 1000).toLocaleDateString() : 'Community Wiki'}</span>
+                  </div>
+                  <span style="font-size:0.72rem; color:var(--text-muted); font-style:italic;">
+                    Open for all registered members to edit &bull; Crowdsourced lore
+                  </span>
+                </div>
+              </div>
+            `;
+          } catch(e) {
+            slot.innerHTML = '';
+          }
+        }
+
+        async openEncyclopediaModal(category, name) {
+          try {
+            const res = await this.api('encyclopedia_get', { category, name });
+            let parsedHtml = '';
+            if (res.body) {
+              try {
+                parsedHtml = (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined')
+                  ? DOMPurify.sanitize(marked.parse(res.body))
+                  : this.escape(res.body).replace(/\n/g, '<br>');
+              } catch(e) {
+                parsedHtml = this.escape(res.body).replace(/\n/g, '<br>');
+              }
+            }
+
+            const revCount = Number(res.revision_count || (res.body ? 1 : 0));
+            const topThumbUrl = res.top_artwork_cover ? `?action=thumb&f=${encodeURIComponent(res.top_artwork_cover)}` : '';
+
+            const html = `
+              <div class="modal-header">
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span class="encyclopedia-badge ${category}">${category}</span>
+                  <span>${this.escape(name)} Encyclopedia</span>
+                </div>
+                <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+              </div>
+              <div class="modal-body" style="gap:1rem;">
+                <div class="encyclopedia-main-row">
+                  ${res.top_artwork_id > 0 && topThumbUrl ? `
+                    <div class="encyclopedia-preview-thumb" onclick="app.closeModal(); app.nav('#/artwork/${res.top_artwork_id}')" title="Most Viewed: ${this.escape(res.top_artwork_title)} (${res.top_artwork_views.toLocaleString()} views) - Click to open post">
+                      <img src="${topThumbUrl}" alt="${this.escape(res.top_artwork_title)}" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(res.top_artwork_cover)}'">
+                      <div class="encyclopedia-preview-badge">&#9733; ${(res.top_artwork_views || 0).toLocaleString()} views</div>
+                    </div>
+                  ` : ''}
+                  <div style="flex:1; min-width:0;">
+                    ${res.body ? `<div class="encyclopedia-body">${parsedHtml}</div>` : `<p style="font-size:0.88rem; color:var(--text-muted);">No article written yet. Registered members can write lore anytime!</p>`}
+                  </div>
+                </div>
+
+                <div style="font-size:0.75rem; color:var(--text-muted); border-top:1px solid var(--border-subtle); padding-top:0.6rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem;">
+                  <span>${res.editor_name ? `Last editor: <strong>${this.escape(res.editor_name)}</strong>` : 'Community Encyclopedia'}</span>
+                  <span>All registered members can edit &bull; Pixiv-style</span>
+                </div>
+              </div>
+              <div class="modal-footer" style="justify-content:space-between;">
+                <div>
+                  ${revCount > 0 ? `
+                    <button type="button" class="btn-subtle" onclick="app.openEncyclopediaHistoryModal('${category}', '${this.escape(name)}')">History (${revCount})</button>
+                  ` : ''}
+                </div>
+                <div style="display:flex; gap:0.5rem;">
+                  <button type="button" class="btn-subtle" onclick="app.closeModal()">Close</button>
+                  <button type="button" class="btn-primary" onclick="app.openEncyclopediaEditModal('${category}', '${this.escape(name)}')">
+                    ${res.body ? 'Edit Article' : 'Write Article'}
+                  </button>
+                </div>
+              </div>
+            `;
+            this.showModal(html);
+          } catch(err) {
+            this.toast(err.message);
+          }
+        }
+
+        async openEncyclopediaEditModal(category, name) {
+          if (!this.user) {
+            this.toast('Please log in. All registered accounts can edit the encyclopedia!');
+            this.showAuthModal();
+            return;
+          }
+          try {
+            const res = await this.api('encyclopedia_get', { category, name });
+            const captchaUrl = `?action=encyclopedia_captcha&t=${Date.now()}`;
+
+            const html = `
+              <div class="modal-header">
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span class="encyclopedia-badge ${category}">${category}</span>
+                  <span>Edit Article: ${this.escape(name)}</span>
+                </div>
+                <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+              </div>
+              <form onsubmit="app.handleEncyclopediaSubmit(event)">
+                <input type="hidden" name="category" value="${this.escape(category)}">
+                <input type="hidden" name="name" value="${this.escape(name)}">
+                <div class="modal-body" style="gap:0.9rem;">
+                  <div style="background:var(--bg-surface-elevated); border:1px solid var(--border-subtle); border-radius:10px; padding:0.75rem 0.95rem; font-size:0.8rem; color:var(--text-secondary); line-height:1.5;">
+                    <strong style="color:var(--text-primary);">&#128214; Community Encyclopedia:</strong> Anyone with an account can freely contribute and improve this article (limit: 10 edits/day). Your pseudonym (<strong>${this.escape(this.user.artist_name)}</strong>) will be recorded in the revision history.
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">Article Lore &amp; Information (Markdown Enabled)</label>
+                    <textarea name="body" class="form-textarea" style="min-height:210px; font-size:0.88rem; line-height:1.5;" placeholder="Document character backstory, world lore, origin, personality, or tag explanation..." required>${this.escape(res.body || '')}</textarea>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">Edit Summary (Optional)</label>
+                    <input type="text" name="edit_summary" class="form-input" placeholder="e.g., Added character background, fixed typo, expanded lore..." maxlength="200">
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">Security Verification (Anti-Spam Captcha) *</label>
+                    <div style="display:flex; align-items:center; gap:0.6rem;">
+                      <img id="enc-captcha-img" src="${captchaUrl}" style="height:38px; border-radius:8px; border:1px solid var(--border-subtle); cursor:pointer; background:#14141a;" onclick="this.src='?action=encyclopedia_captcha&t='+Date.now()" title="Click to refresh captcha">
+                      <input type="text" name="captcha" class="form-input" style="max-width:130px; text-align:center; font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1rem;" placeholder="Answer" required autocomplete="off">
+                      <button type="button" class="btn-subtle" style="height:38px; padding:0 0.75rem; font-size:0.85rem;" onclick="document.getElementById('enc-captcha-img').src='?action=encyclopedia_captcha&t='+Date.now()" title="Refresh Captcha">&#x21bb;</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn-subtle" onclick="app.closeModal()">Cancel</button>
+                  <button type="submit" class="btn-primary" id="btn-save-encyclopedia">Publish to Encyclopedia</button>
+                </div>
+              </form>
+            `;
+            this.showModal(html);
+          } catch(e) {
+            this.toast(e.message);
+          }
+        }
+
+        async handleEncyclopediaSubmit(e) {
+          e.preventDefault();
+          const btn = document.getElementById('btn-save-encyclopedia');
+          if (btn) { btn.disabled = true; btn.innerText = 'Publishing...'; }
+          const fd = new FormData(e.target);
+          try {
+            const res = await this.api('encyclopedia_save', fd, 'POST');
+            this.closeModal();
+            this.toast('Article published to community encyclopedia!');
+            this.loadFeedEncyclopedia(res.category, res.name);
+          } catch(err) {
+            this.toast(err.message);
+            const captchaImg = document.getElementById('enc-captcha-img');
+            if (captchaImg) captchaImg.src = `?action=encyclopedia_captcha&t=${Date.now()}`;
+            const captchaInput = e.target.querySelector('input[name="captcha"]');
+            if (captchaInput) { captchaInput.value = ''; captchaInput.focus(); }
+            if (btn) { btn.disabled = false; btn.innerText = 'Publish to Encyclopedia'; }
+          }
+        }
+
+        async openEncyclopediaHistoryModal(category, name) {
+          try {
+            const res = await this.api('encyclopedia_history', { category, name });
+            const history = res.history || [];
+            const html = `
+              <div class="modal-header">
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span class="encyclopedia-badge ${category}">${category}</span>
+                  <span>${this.escape(name)} &ndash; Revision History</span>
+                </div>
+                <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+              </div>
+              <div class="modal-body" style="gap:0.75rem; max-height:60vh; overflow-y:auto;">
+                ${!history.length ? `<p style="font-size:0.85rem; color:var(--text-muted);">No recorded past revisions yet.</p>` : `
+                  <div style="display:flex; flex-direction:column; gap:0.55rem;">
+                    ${history.map(item => `
+                      <div style="background:var(--bg-surface-elevated); border:1px solid var(--border-subtle); border-radius:10px; padding:0.7rem 0.9rem; display:flex; justify-content:space-between; align-items:center; gap:0.75rem;">
+                        <div style="min-width:0;">
+                          <div style="font-weight:700; font-size:0.85rem; color:var(--text-primary); margin-bottom:0.15rem;">
+                            ${this.escape(item.editor_name || 'Anonymous Artist')}
+                          </div>
+                          <div style="font-size:0.78rem; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                            ${this.escape(item.edit_summary || 'Updated article content')}
+                          </div>
+                        </div>
+                        <span style="font-size:0.72rem; color:var(--text-muted); flex-shrink:0;">
+                          ${new Date(item.created_at * 1000).toLocaleString()}
+                        </span>
+                      </div>
+                    `).join('')}
+                  </div>
+                `}
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn-subtle" onclick="app.openEncyclopediaModal('${category}', '${this.escape(name)}')">&laquo; Back to Article</button>
+                <button type="button" class="btn-primary" onclick="app.openEncyclopediaEditModal('${category}', '${this.escape(name)}')">Contribute Edit</button>
+              </div>
+            `;
+            this.showModal(html);
+          } catch(e) {
+            this.toast(e.message);
+          }
+        }
+
+        async exportArtworkPost(artworkId) {
+          const modalHtml = `
+            <div class="modal-header">
+              <span>Exporting Post Package (.zip)</span>
+              <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+            </div>
+            <div class="modal-body" style="gap:1rem;">
+              <div style="display:flex; align-items:center; gap:0.75rem;">
+                <div class="spinner" id="export-spinner" style="margin:0; width:26px; height:26px; flex-shrink:0;"></div>
+                <div style="min-width:0; flex:1;">
+                  <div id="export-status-title" style="font-weight:700; font-size:0.95rem;">Preparing Export Package...</div>
+                  <div id="export-status-subtitle" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.2rem;">Compiling post metadata and media items on server...</div>
+                </div>
+              </div>
+
+              <div style="width:100%; background:var(--bg-base); height:10px; border-radius:5px; overflow:hidden; border:1px solid var(--border-subtle);">
+                <div id="export-progress-fill" style="width:0%; height:100%; background:var(--accent); border-radius:5px; transition:width 0.15s ease;"></div>
+              </div>
+
+              <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--text-secondary);">
+                <span id="export-bytes-text">0 MB / 0 MB</span>
+                <span id="export-percent-text" style="font-weight:700; color:var(--accent);">0%</span>
+              </div>
+            </div>
+          `;
+          this.showModal(modalHtml);
+
+          try {
+            const res = await fetch(`?action=artwork_export&id=${artworkId}`);
+            if (!res.ok) {
+              let errMsg = 'Failed to export post package.';
+              try {
+                const errJson = await res.json();
+                if (errJson.error) errMsg = errJson.error;
+              } catch(e) {}
+              throw new Error(errMsg);
+            }
+
+            const contentLength = res.headers.get('content-length');
+            const totalBytes = contentLength ? parseInt(contentLength, 10) : 0;
+            const reader = res.body.getReader();
+            const chunks = [];
+            let receivedBytes = 0;
+
+            const statusTitle = document.getElementById('export-status-title');
+            const statusSubtitle = document.getElementById('export-status-subtitle');
+            const progressFill = document.getElementById('export-progress-fill');
+            const bytesText = document.getElementById('export-bytes-text');
+            const percentText = document.getElementById('export-percent-text');
+
+            if (statusTitle) statusTitle.innerText = 'Transferring export package...';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+              receivedBytes += value.length;
+
+              if (totalBytes > 0) {
+                const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
+                if (progressFill) progressFill.style.width = `${pct}%`;
+                if (percentText) percentText.innerText = `${pct}%`;
+                const recMB = (receivedBytes / (1024 * 1024)).toFixed(1);
+                const totMB = (totalBytes / (1024 * 1024)).toFixed(1);
+                if (bytesText) bytesText.innerText = `${recMB} MB / ${totMB} MB`;
+                if (statusSubtitle) statusSubtitle.innerText = `${pct}% downloaded (${recMB} MB of ${totMB} MB)`;
+              } else {
+                const recMB = (receivedBytes / (1024 * 1024)).toFixed(1);
+                if (bytesText) bytesText.innerText = `${recMB} MB transferred`;
+                if (progressFill) progressFill.style.width = '100%';
+                if (statusSubtitle) statusSubtitle.innerText = `${recMB} MB received`;
+              }
+            }
+
+            if (statusTitle) statusTitle.innerText = 'Finalizing package...';
+            const blob = new Blob(chunks, { type: 'application/zip' });
+
+            let downloadName = `artwork_${artworkId}_export.zip`;
+            const dispo = res.headers.get('content-disposition');
+            if (dispo) {
+              const match = dispo.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+              if (match && match[1]) downloadName = decodeURIComponent(match[1]);
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = blobUrl;
+            link.download = downloadName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+
+            if (statusTitle) statusTitle.innerText = 'Export Completed!';
+            if (statusSubtitle) statusSubtitle.innerText = 'Package downloaded successfully.';
+            const spinner = document.getElementById('export-spinner');
+            if (spinner) spinner.style.display = 'none';
+
+            setTimeout(() => this.closeModal(), 1200);
+          } catch(err) {
+            const statusTitle = document.getElementById('export-status-title');
+            const statusSubtitle = document.getElementById('export-status-subtitle');
+            const progressFill = document.getElementById('export-progress-fill');
+            if (statusTitle) {
+              statusTitle.innerText = 'Export Failed';
+              statusTitle.style.color = 'var(--r18)';
+            }
+            if (statusSubtitle) statusSubtitle.innerText = err.message;
+            if (progressFill) progressFill.style.background = 'var(--r18)';
+            this.toast(err.message);
+          }
+        }
+
         toggleAdvSearch() {
           const el = document.getElementById('adv-search-panel');
           if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
@@ -4553,15 +5501,44 @@ if ($action) {
             `;
   
             if (sourceId > 0) {
-              const res = await this.api('similar_search', { source_id: sourceId });
+              const imgIndex = parseInt(params.get('image_index') || params.get('sort_order') || '0', 10);
+              const res = await this.api('similar_search', { source_id: sourceId, image_index: imgIndex });
               if (res.source_art) {
+                const currentSort = res.source_art.selected_sort_order || 0;
+                const allImgs = res.source_art.all_images || [];
+
                 html += `
-                  <div style="display:flex; align-items:center; gap:1rem; background:var(--bg-surface-elevated); padding:0.9rem 1.2rem; border-radius:12px; border:1px solid var(--border-subtle); margin-bottom:1.4rem;">
-                    <img src="?action=thumb&f=${encodeURIComponent(res.source_art.cover_file)}" style="width:60px; height:60px; border-radius:8px; object-fit:cover;" alt="" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(res.source_art.cover_file)}'">
-                    <div>
-                      <span style="font-size:0.8rem; color:var(--text-muted); text-transform:uppercase; font-weight:700;">Matching Against:</span>
-                      <h3 style="font-size:1.05rem; font-weight:700;">${this.escape(res.source_art.title)}</h3>
+                  <div style="background:var(--bg-surface-elevated); padding:1rem 1.25rem; border-radius:14px; border:1px solid var(--border-subtle); margin-bottom:1.4rem; display:flex; flex-direction:column; gap:0.85rem;">
+                    <div style="display:flex; align-items:center; gap:1rem; justify-content:space-between; flex-wrap:wrap;">
+                      <div style="display:flex; align-items:center; gap:1rem;">
+                        <img src="?action=thumb&f=${encodeURIComponent(res.source_art.cover_file)}" style="width:64px; height:64px; border-radius:8px; object-fit:cover; border:2px solid var(--accent); background:#000;" alt="" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(res.source_art.cover_file)}'">
+                        <div>
+                          <span style="font-size:0.75rem; color:var(--text-muted); text-transform:uppercase; font-weight:800; letter-spacing:0.5px;">Matching Thumbnail:</span>
+                          <h3 style="font-size:1.1rem; font-weight:800; margin-top:0.15rem;">${this.escape(res.source_art.title)}</h3>
+                          <span style="font-size:0.8rem; color:var(--accent); font-weight:700;">Page #${currentSort + 1}${allImgs.length > 1 ? ` of ${allImgs.length}` : ''}</span>
+                        </div>
+                      </div>
+                      <button type="button" class="btn-subtle" style="height:32px; font-size:0.78rem;" onclick="app.nav('#/artwork/${res.source_art.id}')">View Full Post</button>
                     </div>
+
+                    ${allImgs.length > 1 ? `
+                      <div style="border-top:1px solid var(--border-subtle); padding-top:0.75rem; display:flex; flex-direction:column; gap:0.45rem;">
+                        <span style="font-size:0.75rem; font-weight:800; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.4px;">
+                          Switch Image Page to Match:
+                        </span>
+                        <div style="display:flex; gap:0.6rem; overflow-x:auto; padding-bottom:0.3rem; scroll-behavior:smooth;">
+                          ${allImgs.map((im, idx) => {
+                            const isSelected = (idx === currentSort);
+                            return `
+                              <div class="thumb-reel-item ${isSelected ? 'active' : ''}" style="width:56px; height:56px; border-radius:8px; flex-shrink:0; cursor:pointer; position:relative; border:2px solid ${isSelected ? 'var(--accent)' : 'var(--border-subtle)'}; background:#000;" onclick="app.updateParam('image_index', ${idx})" title="Match Page #${idx + 1}">
+                                <img src="?action=thumb&f=${encodeURIComponent(im.file_name)}" style="width:100%; height:100%; object-fit:cover; border-radius:6px;" alt="">
+                                <span style="position:absolute; bottom:2px; right:2px; font-size:0.62rem; font-weight:800; background:rgba(0,0,0,0.8); color:#fff; padding:1px 4px; border-radius:3px;">#${idx + 1}</span>
+                              </div>
+                            `;
+                          }).join('')}
+                        </div>
+                      </div>
+                    ` : ''}
                   </div>
                 `;
               }
@@ -5172,10 +6149,11 @@ if ($action) {
             const isOwner = this.user && (this.user.id == art.user_id || this.user.is_admin);
             const avatarUrl = this.getAvatar(art.avatar, art.artist_name, art.email_hash);
   
-            const tagsArr = (art.tag_list && art.tag_list.length) ? art.tag_list : (art.tags ? art.tags.split(/[,#、\s]+/).filter(Boolean) : []);
-            const charArr = art.characters ? art.characters.split(/[,、\s]+/).filter(Boolean) : [];
-            const parodyArr = art.parodies ? art.parodies.split(/[,、\s]+/).filter(Boolean) : [];
-            const toolsArr = art.tools ? art.tools.split(/[,、\s]+/).filter(Boolean) : [];
+            // Separate by comma only (spaces preserved inside names)
+            const tagsArr = (art.tag_list && art.tag_list.length) ? art.tag_list : (art.tags ? art.tags.split(/[,，、]+/).map(s => s.trim()).filter(Boolean) : []);
+            const charArr = art.characters ? art.characters.split(/[,，、]+/).map(s => s.trim()).filter(Boolean) : [];
+            const parodyArr = art.parodies ? art.parodies.split(/[,，、]+/).map(s => s.trim()).filter(Boolean) : [];
+            const toolsArr = art.tools ? art.tools.split(/[,，、]+/).map(s => s.trim()).filter(Boolean) : [];
   
             const images = art.images || [];
             const leadImg = images[0] || {};
@@ -5352,24 +6330,60 @@ if ($action) {
                       </div>
                       ${isOwner ? `
                         <div class="artwork-owner-actions">
+                          <button type="button" class="btn-subtle" style="gap:0.35rem;" onclick="app.exportArtworkPost(${art.id})" title="Export Post Package (.zip) with live progress">
+                            <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                            <span>Export Post (.zip)</span>
+                          </button>
                           <button class="btn-subtle" onclick="app.nav('#/edit/${art.id}')">Edit Post</button>
                           <button class="btn-subtle" style="color:var(--r18);" onclick="app.deleteArtwork(${art.id})">Delete</button>
                         </div>
                     ` : ''}
                     </div>
 
-                    ${art.source_url ? `
-                      <div style="font-size:0.85rem; color:var(--text-muted);">
-                        <strong>Original Source:</strong> <a href="${this.safeUrl(art.source_url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent); text-decoration:underline;">${this.escape(art.source_url)}</a>
-                      </div>
-                    ` : ''}
+                    ${art.source_url ? (() => {
+                      const urls = art.source_url.split(/[\r\n,\s]+/).map(u => u.trim()).filter(Boolean);
+                      if (!urls.length) return '';
+                      return `
+                        <div style="font-size:0.85rem; color:var(--text-muted); display:flex; flex-wrap:wrap; gap:0.55rem; align-items:center;">
+                          <strong>Original Source${urls.length > 1 ? 's' : ''}:</strong>
+                          ${urls.map((u, i) => {
+                            let domain = '';
+                            try { domain = new URL(u).hostname.replace(/^www\./, ''); } catch(e) { domain = `Link #${i + 1}`; }
+                            return `
+                              <a href="${this.safeUrl(u)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent); text-decoration:underline; display:inline-flex; align-items:center; gap:0.25rem;" title="${this.escape(u)}">
+                                <svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+                                <span>${urls.length > 1 ? `${domain} (#${i + 1})` : this.escape(u)}</span>
+                              </a>
+                            `;
+                          }).join('')}
+                        </div>
+                      `;
+                    })() : ''}
 
                     ${renderedDescription ? `<div style="font-size:0.92rem; line-height:1.6; color:var(--text-primary);">${renderedDescription}</div>` : ''}
 
                     <div class="tag-cloud">
-                      ${parodyArr.map(p => `<span class="tag-pill special-parody" onclick="app.nav('#/explore?parody=${encodeURIComponent(p)}')"><svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg> <span>Series: ${this.escape(p)}</span></span>`).join('')}
-                      ${charArr.map(c => `<span class="tag-pill special-character" onclick="app.nav('#/explore?character=${encodeURIComponent(c)}')"><svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg> <span>Character: ${this.escape(c)}</span></span>`).join('')}
-                      ${tagsArr.map(t => `<span class="tag-pill" onclick="app.nav('#/explore?tag=${encodeURIComponent(t)}')"><svg viewBox="0 0 24 24"><path d="M21.41 11.58l-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58.55 0 1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41 0-.55-.23-1.06-.59-1.42zM5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7z"/></svg> <span>#${this.escape(t)}</span></span>`).join('')}
+                      ${parodyArr.map(p => `
+                        <span class="tag-pill special-parody" onclick="app.nav('#/explore?parody=${encodeURIComponent(p)}')">
+                          <svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
+                          <span>Series: ${this.escape(p)}</span>
+                          <span style="opacity:0.6; padding-left:2px;" onclick="event.stopPropagation(); app.openEncyclopediaModal('parody', '${this.escape(p)}')" title="View Encyclopedia">&#128214;</span>
+                        </span>
+                      `).join('')}
+                      ${charArr.map(c => `
+                        <span class="tag-pill special-character" onclick="app.nav('#/explore?character=${encodeURIComponent(c)}')">
+                          <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+                          <span>Character: ${this.escape(c)}</span>
+                          <span style="opacity:0.6; padding-left:2px;" onclick="event.stopPropagation(); app.openEncyclopediaModal('character', '${this.escape(c)}')" title="View Encyclopedia">&#128214;</span>
+                        </span>
+                      `).join('')}
+                      ${tagsArr.map(t => `
+                        <span class="tag-pill" onclick="app.nav('#/explore?tag=${encodeURIComponent(t)}')">
+                          <svg viewBox="0 0 24 24"><path d="M21.41 11.58l-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58.55 0 1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41 0-.55-.23-1.06-.59-1.42zM5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7z"/></svg>
+                          <span>#${this.escape(t)}</span>
+                          <span style="opacity:0.6; padding-left:2px;" onclick="event.stopPropagation(); app.openEncyclopediaModal('tag', '${this.escape(t)}')" title="View Encyclopedia">&#128214;</span>
+                        </span>
+                      `).join('')}
                       ${toolsArr.map(tl => `<span class="tag-pill special-tool"><svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg> <span>Tool: ${this.escape(tl)}</span></span>`).join('')}
                     </div>
 
@@ -5378,14 +6392,16 @@ if ($action) {
                         <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
                         <span>Like (${art.like_count || 0})</span>
                       </button>
+                      ${!isLeadVid && art.type !== 'video' ? `
+                        <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.nav('#/similar?source_id=${art.id}&image_index=' + app.currentLeadIndex)" title="Find visually similar artworks using this image">
+                          <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+                          <span>Find Similar</span>
+                        </button>
+                      ` : ''}
                       <button class="btn-subtle" style="gap:0.4rem;" data-id="${art.id}" data-title="${this.escape(art.title)}" data-artist="${this.escape(art.artist_name)}" onclick="app.showShareModal(this.dataset.id, this.dataset.title, this.dataset.artist)">
                         <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92c0-1.61-1.31-2.92-2.92-2.92z"/></svg>
                         <span>Share</span>
                       </button>
-                      <a href="?action=artwork_export&id=${art.id}" class="btn-subtle" style="gap:0.4rem;" download>
-                        <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                        <span>Export Post (.zip)</span>
-                      </a>
                       ${images.length > 1 ? `
                         <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.downloadArtworkZip(${art.id})">
                           <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
@@ -6196,6 +7212,13 @@ if ($action) {
           const html = `
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.2rem; flex-wrap:wrap; gap:0.6rem;">
               <h2 style="font-size:1.4rem; font-weight:800; margin:0;">${editId ? 'Edit Artwork Studio' : 'Publish Artwork or Video'}</h2>
+              <div style="display:flex; gap:0.5rem; align-items:center;">
+                ${editId ? `
+                  <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.exportArtworkPost(${editId})" title="Export Post Package (.zip) with progress">
+                    <svg viewBox="0 0 24 24" style="width:15px;height:15px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                    <span>Export Post (.zip)</span>
+                  </button>
+                ` : ''}
                 ${!editId ? `
                   <button type="button" class="btn-primary" onclick="app.showImportModal()">
                     <svg viewBox="0 0 24 24" style="width:16px; height:16px;"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
@@ -6203,130 +7226,130 @@ if ($action) {
                   </button>
                 ` : ''}
               </div>
-
-              <form onsubmit="app.handleArtworkSubmit(event)">
-                <input type="hidden" name="id" value="${artData.id || 0}">
-  
-                ${!editId ? `
-                  <div class="form-group" style="margin-bottom:1.2rem;">
-                    <label class="form-label">Upload Mode Configuration</label>
-                    <div class="mode-card-grid">
-                      <label class="mode-card selected" id="label-mode-single">
-                        <input type="radio" name="post_mode" value="single" checked onchange="app.setPostMode('single')">
-                        <div class="mode-card-info">
-                          <span class="mode-card-title">
-                            <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg>
-                            Single Post (Multi-Page Series)
-                          </span>
-                          <span class="mode-card-desc">All files become consecutive high-res pages of a single post with a "See All" expander.</span>
-                        </div>
-                      </label>
-  
-                      <label class="mode-card" id="label-mode-batch">
-                        <input type="radio" name="post_mode" value="batch" onchange="app.setPostMode('batch')">
-                        <div class="mode-card-info">
-                          <span class="mode-card-title">
-                            <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
-                            One Artwork per Image (Batch)
-                          </span>
-                          <span class="mode-card-desc">Each uploaded file creates its own standalone artwork post with shared title and metadata.</span>
-                        </div>
-                      </label>
-                    </div>
-                  </div>
-                ` : ''}
-  
-                <div class="form-group">
-                  <label class="form-label">Upload Files (Chunked multi-file &amp; video support)</label>
-                  <div class="upload-zone" id="studio-dropzone" onclick="document.getElementById('studio-file-input').click()">
-                    <svg viewBox="0 0 24 24" style="width:40px; height:40px; color:var(--accent);"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
-                    <span style="font-weight:700; font-size:0.95rem;">Drop multiple files here or click to browse</span>
-                    <span style="font-size:0.75rem; color:var(--text-muted);">Max 500 images per post &bull; 10 images/day for separate individual posts</span>
-                  </div>
-                  <input type="file" id="studio-file-input" multiple style="display:none;" accept="image/*,video/*" onchange="app.handleStudioFiles(this.files)">
-
-                  <div id="studio-upload-progress" style="display:none; margin-top:0.85rem; background:var(--bg-surface-elevated); border:1px solid var(--border-subtle); border-radius:12px; padding:0.85rem 1rem;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.82rem; font-weight:600; margin-bottom:0.45rem;">
-                      <span id="upload-status-text" style="color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80%;">Preparing upload...</span>
-                      <span id="upload-percent-text" style="color:var(--accent); font-weight:700;">0%</span>
-                    </div>
-                    <div style="width:100%; height:6px; background:var(--bg-base); border-radius:3px; overflow:hidden;">
-                      <div id="upload-progress-bar" style="width:0%; height:100%; background:var(--accent); border-radius:3px; transition:width 0.15s ease;"></div>
-                    </div>
-                  </div>
-
-                  <div class="upload-preview-grid" id="studio-preview-grid"></div>
-                </div>
-  
-                <div class="form-group" style="margin-top:1.2rem;">
-                  <label class="form-label">Original Source URL (Optional)</label>
-                  <input type="url" name="source_url" id="studio-source-url" class="form-input" placeholder="https://..." value="${this.escape(artData.source_url || '')}" oninput="app.checkDuplicateUrl(this.value)">
-                  <div id="source-check-status" style="font-size:0.78rem; margin-top:0.25rem;"></div>
-                </div>
-  
-                <div class="form-group" style="margin-top:1.2rem;">
-                  <label class="form-label">Artwork Title *</label>
-                  <input type="text" name="title" class="form-input" placeholder="Give your creation an evocative title" value="${this.escape(artData.title)}" required>
-                </div>
-  
-                <div class="form-group" style="margin-top:1.2rem;">
-                  <label class="form-label">Caption / Description (Markdown enabled)</label>
-                  <textarea name="description" class="form-textarea" placeholder="Describe the lore, brushes used, or artist commentary...">${this.escape(artData.description)}</textarea>
-                </div>
-  
-                <div class="form-grid-2" style="margin-top:1.2rem;">
-                  <div class="form-group">
-                    <label class="form-label">Category</label>
-                    <select name="type" class="form-select">
-                      <option value="illust" ${artData.type === 'illust' ? 'selected' : ''}>Illustration / Picture</option>
-                      <option value="manga" ${artData.type === 'manga' ? 'selected' : ''}>Manga / Comic</option>
-                      <option value="video" ${artData.type === 'video' ? 'selected' : ''}>Animation / Video Clip</option>
-                    </select>
-                  </div>
-                  <div class="form-group">
-                    <label class="form-label">Age Rating</label>
-                    <select name="rating" class="form-select">
-                      <option value="all" ${artData.rating === 'all' ? 'selected' : ''}>All Ages (General)</option>
-                      <option value="r18" ${artData.rating === 'r18' ? 'selected' : ''}>R-18 (Mature Only)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div class="form-group" style="margin-top:1.2rem;">
-                  <label class="form-label">Tags (comma, hashtag, or space separated)</label>
-                  <input type="text" name="tags" class="form-input" placeholder="original, anime, landscape, fantasy, vocaloid" value="${this.escape(artData.tags)}">
-                </div>
-
-                <div class="form-grid-2" style="margin-top:1.2rem;">
-                  <div class="form-group">
-                    <label class="form-label">Characters Depicted</label>
-                    <input type="text" name="characters" class="form-input" placeholder="Hatsune Miku, Frieren" value="${this.escape(artData.characters)}">
-                  </div>
-                  <div class="form-group">
-                    <label class="form-label">Series / Parody</label>
-                    <input type="text" name="parodies" class="form-input" placeholder="Vocaloid, Hololive, Genshin Impact" value="${this.escape(artData.parodies)}">
-                  </div>
-                </div>
-
-                <div class="form-grid-2" style="margin-top:1.2rem; align-items:flex-end;">
-                  <div class="form-group">
-                    <label class="form-label">Tools Used</label>
-                    <input type="text" name="tools" class="form-input" placeholder="Clip Studio Paint, Photoshop, Blender" value="${this.escape(artData.tools)}">
-                  </div>
-                  <div class="form-group" style="min-height:38px; justify-content:center;">
-                    <label style="display:inline-flex; align-items:center; gap:0.55rem; cursor:pointer; font-size:0.88rem; font-weight:600; margin:0;">
-                      <input type="checkbox" name="is_ai" value="1" ${artData.is_ai ? 'checked' : ''} style="width:18px; height:18px; accent-color:var(--accent); margin:0;">
-                      <span>AI-Generated Creation</span>
+            </div>
+          
+            <form onsubmit="app.handleArtworkSubmit(event)">
+              <input type="hidden" name="id" value="${artData.id || 0}">
+          
+              ${!editId ? `
+                <div class="form-group" style="margin-bottom:1.2rem;">
+                  <label class="form-label">Upload Mode Configuration</label>
+                  <div class="mode-card-grid">
+                    <label class="mode-card selected" id="label-mode-single">
+                      <input type="radio" name="post_mode" value="single" checked onchange="app.setPostMode('single')">
+                      <div class="mode-card-info">
+                        <span class="mode-card-title">
+                          <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg>
+                          Single Post (Multi-Page Series)
+                        </span>
+                        <span class="mode-card-desc">All files become consecutive high-res pages of a single post with a "See All" expander.</span>
+                      </div>
+                    </label>
+          
+                    <label class="mode-card" id="label-mode-batch">
+                      <input type="radio" name="post_mode" value="batch" onchange="app.setPostMode('batch')">
+                      <div class="mode-card-info">
+                        <span class="mode-card-title">
+                          <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+                          One Artwork per Image (Batch)
+                        </span>
+                        <span class="mode-card-desc">Each uploaded file creates its own standalone artwork post with shared title and metadata.</span>
+                      </div>
                     </label>
                   </div>
                 </div>
-
-                <div class="studio-actions" style="display:flex; justify-content:flex-end; gap:0.6rem; margin-top:1.8rem;">
-                  <button type="button" class="btn-subtle" onclick="window.history.back()">Cancel</button>
-                  <button type="submit" class="btn-primary" id="btn-publish-art">${editId ? 'Save Modifications' : 'Publish Work'}</button>
+              ` : ''}
+          
+              <div class="form-group">
+                <label class="form-label">Upload Files (Chunked multi-file &amp; video support)</label>
+                <div class="upload-zone" id="studio-dropzone" onclick="document.getElementById('studio-file-input').click()">
+                  <svg viewBox="0 0 24 24" style="width:40px; height:40px; color:var(--accent);"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+                  <span style="font-weight:700; font-size:0.95rem;">Drop multiple files here or click to browse</span>
+                  <span style="font-size:0.75rem; color:var(--text-muted);">Max 500 images per post &bull; 10 images/day for separate individual posts</span>
                 </div>
-              </form>
-            </div>
+                <input type="file" id="studio-file-input" multiple style="display:none;" accept="image/*,video/*" onchange="app.handleStudioFiles(this.files)">
+          
+                <div id="studio-upload-progress" style="display:none; margin-top:0.85rem; background:var(--bg-surface-elevated); border:1px solid var(--border-subtle); border-radius:12px; padding:0.85rem 1rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.82rem; font-weight:600; margin-bottom:0.45rem;">
+                    <span id="upload-status-text" style="color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80%;">Preparing upload...</span>
+                    <span id="upload-percent-text" style="color:var(--accent); font-weight:700;">0%</span>
+                  </div>
+                  <div style="width:100%; height:6px; background:var(--bg-base); border-radius:3px; overflow:hidden;">
+                    <div id="upload-progress-bar" style="width:0%; height:100%; background:var(--accent); border-radius:3px; transition:width 0.15s ease;"></div>
+                  </div>
+                </div>
+          
+                <div class="upload-preview-grid" id="studio-preview-grid"></div>
+              </div>
+          
+              <div class="form-group" style="margin-top:1.2rem;">
+                <label class="form-label">Original Source URLs (Optional - multiple URLs allowed, one per line or separated by comma)</label>
+                <textarea name="source_url" id="studio-source-url" class="form-textarea" style="min-height:56px; font-family:'JetBrains Mono',monospace; font-size:0.82rem;" placeholder="https://x.com/...&#10;https://pixiv.net/..." oninput="app.checkDuplicateUrl(this.value)">${this.escape(artData.source_url || '')}</textarea>
+                <div id="source-check-status" style="font-size:0.78rem; margin-top:0.25rem;"></div>
+              </div>
+          
+              <div class="form-group" style="margin-top:1.2rem;">
+                <label class="form-label">Artwork Title *</label>
+                <input type="text" name="title" class="form-input" placeholder="Give your creation an evocative title" value="${this.escape(artData.title)}" required>
+              </div>
+          
+              <div class="form-group" style="margin-top:1.2rem;">
+                <label class="form-label">Caption / Description (Markdown enabled)</label>
+                <textarea name="description" class="form-textarea" placeholder="Describe the lore, brushes used, or artist commentary...">${this.escape(artData.description)}</textarea>
+              </div>
+          
+              <div class="form-grid-2" style="margin-top:1.2rem;">
+                <div class="form-group">
+                  <label class="form-label">Category</label>
+                  <select name="type" class="form-select">
+                    <option value="illust" ${artData.type === 'illust' ? 'selected' : ''}>Illustration / Picture</option>
+                    <option value="manga" ${artData.type === 'manga' ? 'selected' : ''}>Manga / Comic</option>
+                    <option value="video" ${artData.type === 'video' ? 'selected' : ''}>Animation / Video Clip</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Age Rating</label>
+                  <select name="rating" class="form-select">
+                    <option value="all" ${artData.rating === 'all' ? 'selected' : ''}>All Ages (General)</option>
+                    <option value="r18" ${artData.rating === 'r18' ? 'selected' : ''}>R-18 (Mature Only)</option>
+                  </select>
+                </div>
+              </div>
+          
+              <div class="form-group" style="margin-top:1.2rem;">
+                <label class="form-label">Tags (comma separated &bull; spaces allowed inside names)</label>
+                <input type="text" name="tags" class="form-input" placeholder="Wuthering Waves, Anime, Fantasy Landscape" value="${this.escape(artData.tags)}">
+              </div>
+          
+              <div class="form-grid-2" style="margin-top:1.2rem;">
+                <div class="form-group">
+                  <label class="form-label">Characters Depicted (comma separated &bull; spaces allowed)</label>
+                  <input type="text" name="characters" class="form-input" placeholder="Hatsune Miku, Rover, Yangyang" value="${this.escape(artData.characters)}">
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Series / Parody (comma separated &bull; spaces allowed)</label>
+                  <input type="text" name="parodies" class="form-input" placeholder="Wuthering Waves, Genshin Impact" value="${this.escape(artData.parodies)}">
+                </div>
+              </div>
+          
+              <div class="form-grid-2" style="margin-top:1.2rem; align-items:flex-end;">
+                <div class="form-group">
+                  <label class="form-label">Tools Used (comma separated)</label>
+                  <input type="text" name="tools" class="form-input" placeholder="Clip Studio Paint, Photoshop, Blender" value="${this.escape(artData.tools)}">
+                </div>
+                <div class="form-group" style="min-height:38px; justify-content:center;">
+                  <label style="display:inline-flex; align-items:center; gap:0.55rem; cursor:pointer; font-size:0.88rem; font-weight:600; margin:0;">
+                    <input type="checkbox" name="is_ai" value="1" ${artData.is_ai ? 'checked' : ''} style="width:18px; height:18px; accent-color:var(--accent); margin:0;">
+                    <span>AI-Generated Creation</span>
+                  </label>
+                </div>
+              </div>
+          
+              <div class="studio-actions" style="display:flex; justify-content:flex-end; gap:0.6rem; margin-top:1.8rem;">
+                <button type="button" class="btn-subtle" onclick="window.history.back()">Cancel</button>
+                <button type="submit" class="btn-primary" id="btn-publish-art">${editId ? 'Save Modifications' : 'Publish Work'}</button>
+              </div>
+            </form>
           `;
   
           container.innerHTML = html;
