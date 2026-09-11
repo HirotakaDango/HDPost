@@ -981,7 +981,7 @@ if ($action) {
     $artworkId = intval($_POST['id'] ?? 0);
     $title = trim($_POST['title'] ?? '');
     $description = trim($_POST['description'] ?? '');
-    $type = in_array($_POST['type'] ?? '', ['illust', 'video']) ? $_POST['type'] : 'illust';
+    $type = in_array($_POST['type'] ?? '', ['illust', 'video', 'manga']) ? $_POST['type'] : 'illust';
     $rating = in_array($_POST['rating'] ?? '', ['all', 'r18']) ? $_POST['rating'] : 'all';
     $isAi = !empty($_POST['is_ai']) ? 1 : 0;
     $isOriginal = isset($_POST['is_original']) ? (!empty($_POST['is_original']) ? 1 : 0) : 1;
@@ -1252,7 +1252,7 @@ if ($action) {
       $params[] = $userId;
     }
 
-    if ($type !== 'all' && in_array($type, ['illust', 'video'])) {
+    if ($type !== 'all' && in_array($type, ['illust', 'video', 'manga'])) {
       $where[] = "a.type = ?";
       $params[] = $type;
     }
@@ -1504,6 +1504,41 @@ if ($action) {
     $nextStmt = $db->prepare("SELECT id FROM artworks WHERE id > ? ORDER BY id ASC LIMIT 1");
     $nextStmt->execute([$id]);
     $art['next_id'] = $nextStmt->fetchColumn() ?: null;
+
+    if ($art['type'] === 'manga') {
+      $parodyTrim = trim($art['parodies'] ?? '');
+      $seriesWhere = "a.user_id = ? AND a.type = 'manga'";
+      $seriesParams = [(int)$art['user_id']];
+      if ($parodyTrim !== '') {
+        $seriesWhere .= " AND a.parodies = ?";
+        $seriesParams[] = $parodyTrim;
+      }
+      $seriesStmt = $db->prepare("
+        SELECT a.id, a.title, a.created_at,
+          (SELECT file_name FROM artwork_images WHERE artwork_id = a.id ORDER BY sort_order ASC, id ASC LIMIT 1) as cover_file,
+          (SELECT COUNT(*) FROM artwork_images WHERE artwork_id = a.id) as page_count
+        FROM artworks a
+        WHERE {$seriesWhere}
+        ORDER BY a.created_at ASC, a.id ASC
+      ");
+      $seriesStmt->execute($seriesParams);
+      $seriesList = $seriesStmt->fetchAll();
+
+      $currIdx = 0;
+      foreach ($seriesList as $k => $item) {
+        if ((int)$item['id'] === (int)$art['id']) {
+          $currIdx = $k;
+          break;
+        }
+      }
+
+      $art['manga_series'] = $seriesList;
+      $art['series_title'] = $parodyTrim !== '' ? $parodyTrim : 'Manga Series';
+      $art['series_index'] = $currIdx + 1;
+      $art['series_total'] = count($seriesList);
+      $art['series_prev'] = ($currIdx > 0) ? $seriesList[$currIdx - 1] : null;
+      $art['series_next'] = ($currIdx < count($seriesList) - 1) ? $seriesList[$currIdx + 1] : null;
+    }
 
     jsonResponse($art);
   }
@@ -2644,6 +2679,125 @@ if ($action) {
       }
       .badge-flag.ai { background: #8b5cf6; }
       .badge-flag.video { background: var(--video); }
+      .badge-flag.manga { background: #f97316; }
+
+      /* Manga Series Component */
+      .manga-series-card {
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 10px;
+        padding: 0.6rem 0.75rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.45rem;
+      }
+      .manga-series-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.4rem;
+      }
+      .manga-series-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        background: rgba(249, 115, 22, 0.15);
+        color: #f97316;
+        font-weight: 800;
+        font-size: 0.65rem;
+        padding: 0.15rem 0.4rem;
+        border-radius: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        flex-shrink: 0;
+      }
+      .manga-series-nav-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.4rem;
+      }
+      .manga-series-nav-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 28px;
+        padding: 0 0.5rem;
+        background: var(--bg-surface-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: 6px;
+        color: var(--text-primary);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-decoration: none;
+        cursor: pointer;
+        transition: all 0.15s;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .manga-series-nav-btn:hover {
+        border-color: var(--border-strong);
+        background: var(--bg-surface-hover);
+      }
+      .manga-series-nav-btn.disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+        pointer-events: none;
+      }
+      .manga-series-nav-meta {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        gap: 0.15rem;
+      }
+      .manga-series-nav-dir {
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: var(--text-muted);
+        text-transform: uppercase;
+      }
+      .manga-series-nav-title {
+        font-size: 0.84rem;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .manga-series-episodes-sheet {
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+        max-height: 380px;
+        overflow-y: auto;
+        padding-right: 0.3rem;
+      }
+      .manga-series-episode-item {
+        display: flex;
+        align-items: center;
+        gap: 0.85rem;
+        padding: 0.6rem 0.8rem;
+        border-radius: 10px;
+        background: var(--bg-surface-elevated);
+        border: 1px solid var(--border-subtle);
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .manga-series-episode-item:hover {
+        border-color: var(--accent);
+        background: var(--bg-surface-hover);
+      }
+      .manga-series-episode-item.current {
+        border-color: #f97316;
+        background: rgba(249, 115, 22, 0.1);
+      }
+      .manga-series-episode-thumb {
+        width: 50px;
+        height: 50px;
+        border-radius: 6px;
+        object-fit: cover;
+        background: #000;
+        flex-shrink: 0;
+      }
   
       .art-card-info {
         padding: 0.8rem 0.9rem;
@@ -3407,6 +3561,7 @@ if ($action) {
             if (!hash.startsWith('#/artwork/')) return;
 
             if (e.key === 'ArrowLeft') {
+              // Arrow Left -> Next Post / Episode
               e.preventDefault();
               if (this.currentNextPostId) {
                 this.navigateToArtwork(this.currentNextPostId);
@@ -3414,6 +3569,7 @@ if ($action) {
                 this.toast('No next post.');
               }
             } else if (e.key === 'ArrowRight') {
+              // Arrow Right -> Previous Post / Episode
               e.preventDefault();
               if (this.currentPrevPostId) {
                 this.navigateToArtwork(this.currentPrevPostId);
@@ -3894,6 +4050,7 @@ if ($action) {
                     <div class="art-thumb-wrap">
                       ${coverUrl ? `<img src="${coverUrl}" alt="" loading="lazy" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(coverFileName)}'">` : '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted);">No Media</div>'}
                       ${pageCount > 1 ? `<div class="badge-page-count"><svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg> ${pageCount}P</div>` : ''}
+                      ${art.type === 'manga' ? `<div class="badge-flag manga">MANGA</div>` : ''}
                       ${isVid ? `<div class="badge-flag video">VIDEO</div>` : ''}
                       ${art.rating === 'r18' ? `<div class="badge-flag">R-18</div>` : ''}
                       ${art.is_ai ? `<div class="badge-flag ai">AI</div>` : ''}
@@ -4675,8 +4832,8 @@ if ($action) {
             const isLeadVid = art.type === 'video' || (leadImg.mime_type && leadImg.mime_type.startsWith('video/'));
   
             // Previous/next post IDs for touch swipe and keyboard navigation
-            const prevPostId = art.prev_id || null;
-            const nextPostId = art.next_id || null;
+            const prevPostId = (art.type === 'manga' && art.series_prev) ? art.series_prev.id : (art.prev_id || null);
+            const nextPostId = (art.type === 'manga' && art.series_next) ? art.series_next.id : (art.next_id || null);
             this.currentPrevPostId = prevPostId;
             this.currentNextPostId = nextPostId;
 
@@ -4795,6 +4952,41 @@ if ($action) {
               }
             }
   
+            let mangaSeriesHtml = '';
+            if (art.type === 'manga' && art.manga_series && art.manga_series.length) {
+              const prevEp = art.series_prev;
+              const nextEp = art.series_next;
+              mangaSeriesHtml = `
+                <div class="manga-series-card">
+                  <div class="manga-series-header">
+                    <div style="display:flex; align-items:center; gap:0.4rem; min-width:0; flex:1;">
+                      <span class="manga-series-badge">Series</span>
+                      <span style="font-weight:700; font-size:0.82rem; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${this.escape(art.series_title)}">${this.escape(art.series_title)}</span>
+                      <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600; flex-shrink:0;">(${art.series_index}/${art.series_total})</span>
+                    </div>
+                    <button type="button" class="btn-subtle" style="height:24px; padding:0 0.5rem; font-size:0.7rem; gap:0.25rem; flex-shrink:0;" onclick="app.showMangaSeriesModal()" title="View All Episodes">
+                      <svg viewBox="0 0 24 24" style="width:11px;height:11px;"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+                      <span>All (${art.series_total})</span>
+                    </button>
+                  </div>
+
+                  <div class="manga-series-nav-row">
+                    ${nextEp ? `
+                      <a href="#/artwork/${nextEp.id}" class="manga-series-nav-btn" title="Next: ${this.escape(nextEp.title)}">&larr; Next</a>
+                    ` : `
+                      <div class="manga-series-nav-btn disabled">&larr; Next</div>
+                    `}
+
+                    ${prevEp ? `
+                      <a href="#/artwork/${prevEp.id}" class="manga-series-nav-btn" title="Previous: ${this.escape(prevEp.title)}">Prev &rarr;</a>
+                    ` : `
+                      <div class="manga-series-nav-btn disabled">Prev &rarr;</div>
+                    `}
+                  </div>
+                </div>
+              `;
+            }
+
             let html = `
               <div class="viewer-layout">
                 <div class="viewer-main">
@@ -4888,6 +5080,8 @@ if ($action) {
                     <button class="btn-subtle" style="width:100%; margin-top:0.35rem;" onclick="app.nav('#/user/${art.user_id}')">View All Works</button>
                   </div>
 
+                  ${mangaSeriesHtml}
+
                   <div style="background:var(--bg-surface); border:1px solid var(--border-subtle); border-radius:14px; padding:1rem; display:flex; flex-direction:column; gap:0.6rem;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                       <span style="font-weight:700; font-size:0.88rem;">More from ${this.escape(art.artist_name)}</span>
@@ -4908,6 +5102,46 @@ if ($action) {
           }
         }
   
+        showMangaSeriesModal() {
+          if (!this.currentArt || !this.currentArt.manga_series) return;
+          const art = this.currentArt;
+          const series = art.manga_series;
+          const html = `
+            <div class="modal-header">
+              <div style="display:flex; align-items:center; gap:0.6rem;">
+                <span class="manga-series-badge">Series</span>
+                <span>${this.escape(art.series_title)}</span>
+                <span style="font-size:0.8rem; color:var(--text-muted); font-weight:600;">(${series.length} works)</span>
+              </div>
+              <button class="btn-icon" onclick="app.closeModal()"><svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+            </div>
+            <div class="modal-body">
+              <div class="manga-series-episodes-sheet">
+                ${series.map((item, idx) => {
+                  const isCurrent = Number(item.id) === Number(art.id);
+                  return `
+                    <div class="manga-series-episode-item ${isCurrent ? 'current' : ''}" onclick="app.closeModal(); app.nav('#/artwork/${item.id}')">
+                      <img src="?action=thumb&f=${encodeURIComponent(item.cover_file || '')}" class="manga-series-episode-thumb" alt="" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(item.cover_file || '')}'">
+                      <div style="flex:1; min-width:0;">
+                        <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.2rem;">
+                          <span style="font-weight:700; font-size:0.75rem; color:${isCurrent ? '#f97316' : 'var(--text-muted)'};">#${idx + 1}</span>
+                          ${isCurrent ? '<span style="background:#f97316; color:#fff; font-size:0.65rem; font-weight:800; padding:0.1rem 0.4rem; border-radius:4px;">READING</span>' : ''}
+                        </div>
+                        <div style="font-weight:700; font-size:0.9rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${this.escape(item.title)}</div>
+                        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem;">${item.page_count || 1}P &bull; ${new Date(item.created_at * 1000).toLocaleDateString()}</div>
+                      </div>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button type="button" class="btn-subtle" onclick="app.closeModal()">Close</button>
+            </div>
+          `;
+          this.showModal(html);
+        }
+
         renderMediaContent(imgObj) {
           if (!imgObj || !imgObj.file_name) return '';
           const isV = (imgObj.mime_type && imgObj.mime_type.startsWith('video/')) || /\.(mp4|webm|mov|mkv|ogg)$/i.test(imgObj.file_name);
@@ -5151,13 +5385,13 @@ if ($action) {
             // Swipe threshold: 45px horizontal, predominantly horizontal, within 600ms
             if (Math.abs(diffX) > 45 && Math.abs(diffX) > Math.abs(diffY) * 1.3 && elapsed < 600) {
               if (diffX < 0) {
-                // Swipe Left -> Next Post
-                if (nextId) this.navigateToArtwork(nextId);
-                else this.toast('No next post.');
-              } else if (diffX > 0) {
-                // Swipe Right -> Previous Post
+                // Swipe Left -> Previous Post
                 if (prevId) this.navigateToArtwork(prevId);
                 else this.toast('No previous post.');
+              } else if (diffX > 0) {
+                // Swipe Right -> Next Post
+                if (nextId) this.navigateToArtwork(nextId);
+                else this.toast('No next post.');
               }
             }
           };
@@ -5381,6 +5615,7 @@ if ($action) {
                     <div class="art-thumb-wrap">
                       ${coverUrl ? `<img src="${coverUrl}" alt="" loading="lazy" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(coverFileName)}'">` : '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted);">No Media</div>'}
                       ${pageCount > 1 ? `<div class="badge-page-count"><svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg> ${pageCount}P</div>` : ''}
+                      ${art.type === 'manga' ? `<div class="badge-flag manga">MANGA</div>` : ''}
                       ${isVid ? `<div class="badge-flag video">VIDEO</div>` : ''}
                       ${art.rating === 'r18' ? `<div class="badge-flag">R-18</div>` : ''}
                       ${art.is_ai ? `<div class="badge-flag ai">AI</div>` : ''}
@@ -5596,6 +5831,7 @@ if ($action) {
                     <label class="form-label">Category</label>
                     <select name="type" class="form-select">
                       <option value="illust" ${artData.type === 'illust' ? 'selected' : ''}>Illustration / Picture</option>
+                      <option value="manga" ${artData.type === 'manga' ? 'selected' : ''}>Manga / Comic</option>
                       <option value="video" ${artData.type === 'video' ? 'selected' : ''}>Animation / Video Clip</option>
                     </select>
                   </div>
