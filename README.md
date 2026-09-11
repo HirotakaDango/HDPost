@@ -1,6 +1,6 @@
 # HDPost
 
-<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/61704774-119c-49c3-9a3c-4809a3976caf" />
+<img width="1366" height="685" alt="image" src="https://github.com/user-attachments/assets/66e9b7a7-60f6-41da-bb21-1bbe7c6dee49" />
 
 HDPost is a self-contained, single-file PHP and SQLite creative illustration studio and artwork archive. It provides an art-sharing platform (similar to Pixiv or ArtStation) with zero external server dependencies, responsive client-side routing, and modern media processing.
 
