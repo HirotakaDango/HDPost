@@ -1440,7 +1440,9 @@ if ($action) {
       $params[] = $userId;
     }
 
-    if ($type !== 'all' && in_array($type, ['illust', 'video', 'manga'])) {
+    if ($type === 'artworks') {
+      $where[] = "a.type != 'manga'";
+    } elseif ($type !== 'all' && in_array($type, ['illust', 'video', 'manga'])) {
       $where[] = "a.type = ?";
       $params[] = $type;
     }
@@ -7310,6 +7312,7 @@ if ($action) {
             const profQuery = profParams.get('q') || '';
             const profSort = profParams.get('sort') || 'newest';
             const profRating = profParams.get('rating') || 'all';
+            const profType = profParams.get('type') || 'all';
             const profPage = Math.max(1, parseInt(profParams.get('page') || '1', 10));
 
             const prof = await this.api('user_profile', { user: userId });
@@ -7323,7 +7326,8 @@ if ($action) {
               limit: 24,
               page: profPage,
               sort: profSort,
-              rating: profRating
+              rating: profRating,
+              type: profType
             };
             if (profQuery) reqData.q = profQuery;
 
@@ -7358,23 +7362,28 @@ if ($action) {
                 </div>
               </div>
 
-              <div class="feed-header-wrap" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.4rem; flex-wrap:wrap; gap:0.8rem;">
-                <div>
+              <div class="feed-header-wrap" style="display:flex; flex-direction:column; align-items:stretch; margin-bottom:1.4rem; gap:0.8rem; width:100%;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.4rem;">
                   <h3 style="font-size:1.2rem; font-weight:800; margin:0;">Artworks &amp; Creations</h3>
-                  <p style="font-size:0.8rem; color:var(--text-muted); margin-top:0.2rem;">${arts.total} work${arts.total === 1 ? '' : 's'} available</p>
+                  <p style="font-size:0.8rem; color:var(--text-muted); margin:0;">${arts.total} work${arts.total === 1 ? '' : 's'} available</p>
                 </div>
-                <div class="feed-header-controls" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
-                  <div class="search-bar" style="width:210px; height:36px;">
-                    <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+                <div class="feed-header-controls" style="display:grid !important; grid-template-columns:repeat(3, 1fr) !important; width:100%; gap:0.6rem;">
+                  <div class="search-bar" style="grid-column:span 3 !important; width:100%; height:36px;">
+                    <svg viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 14z"/></svg>
                     <input type="text" placeholder="Search creations..." value="${this.escape(profQuery)}" onkeydown="if(event.key==='Enter') app.updateParam('q', this.value.trim())">
                   </div>
-                  <select class="form-select" style="font-size:0.8rem; height:36px;" onchange="app.updateParam('sort', this.value)">
+                  <select class="form-select custom-select" style="width:100%; font-size:0.8rem; height:36px;" onchange="app.updateParam('type', this.value)">
+                    <option value="all" ${profType === 'all' ? 'selected' : ''}>All Types</option>
+                    <option value="artworks" ${profType === 'artworks' ? 'selected' : ''}>Artworks</option>
+                    <option value="manga" ${profType === 'manga' ? 'selected' : ''}>Manga</option>
+                  </select>
+                  <select class="form-select custom-select" style="width:100%; font-size:0.8rem; height:36px;" onchange="app.updateParam('sort', this.value)">
                     <option value="newest" ${profSort === 'newest' ? 'selected' : ''}>Newest First</option>
                     <option value="popular" ${profSort === 'popular' ? 'selected' : ''}>Most Popular</option>
                     <option value="views" ${profSort === 'views' ? 'selected' : ''}>Most Views</option>
                     <option value="oldest" ${profSort === 'oldest' ? 'selected' : ''}>Oldest</option>
                   </select>
-                  <select class="form-select" style="font-size:0.8rem; height:36px;" onchange="app.updateParam('rating', this.value)">
+                  <select class="form-select custom-select" style="width:100%; font-size:0.8rem; height:36px;" onchange="app.updateParam('rating', this.value)">
                     <option value="all" ${profRating === 'all' ? 'selected' : ''}>All Ratings</option>
                     <option value="safe" ${profRating === 'safe' ? 'selected' : ''}>All Ages Only</option>
                     <option value="r18" ${profRating === 'r18' ? 'selected' : ''}>R-18 Only</option>
