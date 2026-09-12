@@ -219,6 +219,11 @@ function getDB($config) {
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS site_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_artworks_user ON artworks(user_id);
       CREATE INDEX IF NOT EXISTS idx_artworks_type ON artworks(type);
       CREATE INDEX IF NOT EXISTS idx_artworks_rating ON artworks(rating);
@@ -667,6 +672,9 @@ SW;
 
 try {
   $db = getDB($config);
+  $config['max_images_per_post'] = (int)($db->query("SELECT value FROM site_settings WHERE key = 'art_max_images_per_post'")->fetchColumn() ?: 500);
+  $config['daily_limit'] = (int)($db->query("SELECT value FROM site_settings WHERE key = 'art_daily_limit'")->fetchColumn() ?: 10);
+  $config['r18_policy'] = $db->query("SELECT value FROM site_settings WHERE key = 'art_r18_policy'")->fetchColumn() ?: 'blur';
   $currentUser = getCurrentUser($db);
   $isInitialSetup = ((int)$db->query("SELECT COUNT(*) FROM users")->fetchColumn() === 0);
 } catch (Exception $e) {
@@ -1145,12 +1153,18 @@ if ($action) {
       jsonResponse(['error' => 'At least one media file is required.'], 400);
     }
 
-    // Rule 1: Maximum 500 images per post
-    if (count($images) > 500) {
-      jsonResponse(['error' => 'Maximum upload limit is 500 images per post.'], 400);
+    // Enforce dynamic max images per post
+    $maxImagesLimit = (int)($config['max_images_per_post'] ?? 500);
+    if (count($images) > $maxImagesLimit) {
+      jsonResponse(['error' => "Maximum upload limit is {$maxImagesLimit} images per post."], 400);
     }
 
-    // Rule 2: Maximum 10 images/day for separate individual posts (bypassed for Admins)
+    if ($rating === 'r18' && ($config['r18_policy'] ?? 'allow') === 'disabled') {
+      jsonResponse(['error' => 'R-18 submissions are currently disabled by the site administrator.'], 403);
+    }
+
+    // Enforce dynamic daily upload quota for individual/single posts (bypassed for Admins)
+    $artDailyLimit = (int)($config['daily_limit'] ?? 10);
     $isSeparateIndividual = ($postMode === 'batch' && count($images) > 1) || count($images) === 1;
     if (empty($user['is_admin']) && $artworkId === 0 && $isSeparateIndividual) {
       $since24h = time() - 86400;
@@ -1163,9 +1177,9 @@ if ($action) {
       $stmtDaily->execute([$user['id'], $since24h]);
       $dailyIndividualCount = (int)$stmtDaily->fetchColumn();
 
-      if ($dailyIndividualCount >= 10) {
+      if ($dailyIndividualCount >= $artDailyLimit) {
         jsonResponse([
-          'error' => "Daily limit reached for separate individual posts (10/10 published in the last 24 hours). Please wait for the daily reset or publish as a single multi-page post."
+          'error' => "Daily limit reached for separate individual posts ({$artDailyLimit}/{$artDailyLimit} published in the last 24 hours). Please wait for the daily reset or publish as a single multi-page post."
         ], 429);
       }
     }
@@ -1431,7 +1445,10 @@ if ($action) {
       $params[] = $type;
     }
 
-    if ($rating === 'r18') {
+    $r18Policy = $config['r18_policy'] ?? 'allow';
+    if ($r18Policy === 'disabled' || ($r18Policy === 'login_only' && $curUserId <= 0)) {
+      $where[] = "a.rating = 'all'";
+    } elseif ($rating === 'r18') {
       $where[] = "a.rating = 'r18'";
     } elseif ($rating === 'safe') {
       $where[] = "a.rating = 'all'";
@@ -1685,6 +1702,16 @@ if ($action) {
     $stmt->execute([$id]);
     $art = $stmt->fetch();
     if (!$art) jsonResponse(['error' => 'Artwork not found.'], 404);
+
+    $r18Policy = $config['r18_policy'] ?? 'allow';
+    if ($art['rating'] === 'r18') {
+      if ($r18Policy === 'disabled') {
+        jsonResponse(['error' => 'R-18 content is currently disabled by administrator.'], 403);
+      }
+      if ($r18Policy === 'login_only' && $curUserId <= 0) {
+        jsonResponse(['error' => 'Login required to view R-18 content.', 'login_required' => true], 401);
+      }
+    }
 
     $db->prepare("UPDATE artworks SET view_count = view_count + 1 WHERE id = ?")->execute([$id]);
     $art['view_count']++;
@@ -2776,6 +2803,31 @@ if ($action) {
     ]);
   }
 
+  if ($action === 'admin_settings_get') {
+    requireAdmin($db);
+    jsonResponse([
+      'max_images_per_post' => (int)($db->query("SELECT value FROM site_settings WHERE key = 'art_max_images_per_post'")->fetchColumn() ?: 500),
+      'daily_limit'         => (int)($db->query("SELECT value FROM site_settings WHERE key = 'art_daily_limit'")->fetchColumn() ?: 10),
+      'r18_policy'          => $db->query("SELECT value FROM site_settings WHERE key = 'art_r18_policy'")->fetchColumn() ?: 'blur'
+    ]);
+  }
+
+  if ($action === 'admin_settings_save') {
+    verifyCsrfToken();
+    requireAdmin($db);
+    $maxImages = max(1, min(1000, intval($_POST['max_images_per_post'] ?? 500)));
+    $dailyLimit = max(1, min(500, intval($_POST['daily_limit'] ?? 10)));
+    $r18Policy = in_array($_POST['r18_policy'] ?? '', ['blur', 'login_only', 'disabled'], true) ? $_POST['r18_policy'] : 'blur';
+
+    $st = $db->prepare("REPLACE INTO site_settings (key, value) VALUES (?, ?)");
+    $st->execute(['art_max_images_per_post', (string)$maxImages]);
+    $st->execute(['art_daily_limit', (string)$dailyLimit]);
+    $st->execute(['art_r18_policy', $r18Policy]);
+
+    logActivity($db, $currentUser['id'], 'admin_settings', 0, "Updated site policies: R-18 [{$r18Policy}], Max [{$maxImages}], Daily [{$dailyLimit}]");
+    jsonResponse(['success' => true]);
+  }
+
   if ($action === 'activity_list') {
     $user = requireAuth($db);
     $stmt = $db->prepare("
@@ -3133,7 +3185,7 @@ if ($action) {
           display: flex !important;
         }
       }
-  
+
       .sidebar-mobile-header {
         display: none;
         align-items: center;
@@ -3142,7 +3194,94 @@ if ($action) {
         border-bottom: 1px solid var(--border-subtle);
         margin-bottom: 0.4rem;
       }
-  
+
+      /* R-18 Sidebar Toggle Row & Switches */
+      .r18-toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.45rem 0.8rem;
+        margin: 0.2rem 0.25rem;
+        border-radius: 10px;
+        background: var(--bg-surface-elevated);
+        border: 1px solid var(--border-subtle);
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+      .r18-switch {
+        position: relative;
+        display: inline-block;
+        width: 36px;
+        height: 20px;
+        flex-shrink: 0;
+      }
+      .r18-switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .r18-slider {
+        position: absolute;
+        cursor: pointer;
+        inset: 0;
+        background-color: var(--border-strong);
+        transition: background-color 0.2s ease;
+        border-radius: 20px;
+      }
+      .r18-slider::before {
+        position: absolute;
+        content: "";
+        height: 14px;
+        width: 14px;
+        left: 3px;
+        bottom: 3px;
+        background-color: #ffffff;
+        transition: transform 0.2s ease;
+        border-radius: 50%;
+      }
+      .r18-switch input:checked+.r18-slider {
+        background-color: var(--r18);
+      }
+      .r18-switch input:checked+.r18-slider::before {
+        transform: translateX(16px);
+      }
+
+      /* Safe Blur Sensitive Content Filter */
+      .safe-blur-target {
+        filter: blur(28px) brightness(0.65) !important;
+        transition: filter 0.3s cubic-bezier(0.2, 0, 0, 1) !important;
+      }
+      .safe-blur-revealed .safe-blur-target {
+        filter: none !important;
+      }
+      .safe-blur-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: rgba(8, 8, 12, 0.65);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        z-index: 6;
+        cursor: pointer;
+        padding: 0.75rem;
+        text-align: center;
+        color: #ffffff;
+        gap: 6px;
+        transition: background 0.2s, opacity 0.25s ease;
+      }
+      .safe-blur-overlay:hover {
+        background: rgba(8, 8, 12, 0.45);
+      }
+      .safe-blur-revealed .safe-blur-overlay {
+        opacity: 0 !important;
+        pointer-events: none !important;
+        display: none !important;
+      }
+
       .nav-item {
         display: flex;
         align-items: center;
@@ -4211,11 +4350,14 @@ if ($action) {
   
       .admin-tab-nav {
         display: flex;
+        flex-wrap: nowrap;
         gap: 0.4rem;
         border-bottom: 1px solid var(--border-subtle);
         padding-bottom: 0.6rem;
         margin-bottom: 1.2rem;
         overflow-x: auto;
+        scrollbar-width: thin;
+        -webkit-overflow-scrolling: touch;
       }
       .admin-tab-btn {
         padding: 0.5rem 1rem;
@@ -4225,6 +4367,8 @@ if ($action) {
         color: var(--text-secondary);
         background: var(--bg-surface-elevated);
         cursor: pointer;
+        white-space: nowrap;
+        flex-shrink: 0;
       }
       .admin-tab-btn.active {
         background: var(--accent);
@@ -4367,7 +4511,17 @@ if ($action) {
   
         <div class="nav-item active" data-nav="/"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg> Home Feed</div>
         <div class="nav-item" data-nav="/rankings"><svg viewBox="0 0 24 24"><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg> Rankings</div>
-        <div class="nav-item" data-nav="/r18"><svg viewBox="0 0 24 24" style="color:var(--r18);"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg> R-18 Mature</div>
+        <div class="r18-toggle-row" id="sidebar-r18-row">
+          <span style="display:flex; align-items:center; gap:0.45rem;">
+            <svg viewBox="0 0 24 24" style="width:16px; height:16px; color:var(--r18);"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+            <span>Allow R-18</span>
+          </span>
+          <label class="r18-switch" title="Turn on/off R-18 mature works">
+            <input type="checkbox" id="sidebar-r18-toggle" onchange="app.toggleR18(this.checked)">
+            <span class="r18-slider"></span>
+          </label>
+        </div>
+        <div class="nav-item" id="nav-item-r18" data-nav="/r18"><svg viewBox="0 0 24 24" style="color:var(--r18);"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg> R-18 Mature</div>
         <div class="nav-item" data-nav="/similar"><svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg> Similar Search</div>
   
         <div class="nav-divider"></div>
@@ -4396,18 +4550,23 @@ if ($action) {
     <div id="toast-slot"></div>
   
     <script>
-       class HDPostClient {
+      class HDPostClient {
         constructor() {
           this.user = <?= json_encode($currentUser) ?>;
           this.appName = <?= json_encode($config['app_name']) ?>;
           this.needsSetup = <?= $isInitialSetup ? 'true' : 'false' ?>;
           this.csrfToken = <?= json_encode($_SESSION['csrf_token'] ?? '') ?>;
           this.theme = localStorage.getItem('hd_theme') || 'dark';
+          this.r18Enabled = localStorage.getItem('r18_enabled') !== '0';
+          this.r18Policy = <?= json_encode($config['r18_policy'] ?? 'blur') ?>;
           this.chunkSize = <?= (int)$config['max_chunk_size'] ?>;
+          this.maxImagesPerPost = <?= (int)($config['max_images_per_post'] ?? 500) ?>;
+          this.dailyUploadLimit = <?= (int)($config['daily_limit'] ?? 10) ?>;
           this.uploadQueue = [];
           this.currentLeadIndex = 0;
           this.adminState = { tab: 'users', page: 1, q: '', sort: 'id_asc' };
           this.initTheme();
+          this.initR18Toggle();
           this.bindEvents();
           this.renderUserSlot();
 
@@ -4435,6 +4594,41 @@ if ($action) {
               updateLabel();
             };
           }
+        }
+  
+        initR18Toggle() {
+          const isPolicyDisabled = this.r18Policy === 'disabled';
+          const r18Row = document.getElementById('sidebar-r18-row');
+          if (r18Row) r18Row.style.display = isPolicyDisabled ? 'none' : 'flex';
+
+          const toggle = document.getElementById('sidebar-r18-toggle');
+          if (toggle) toggle.checked = !isPolicyDisabled && this.r18Enabled;
+
+          const r18Nav = document.getElementById('nav-item-r18');
+          if (r18Nav) r18Nav.style.display = (!isPolicyDisabled && this.r18Enabled) ? 'flex' : 'none';
+        }
+
+        toggleR18(enabled) {
+          if (this.r18Policy === 'disabled') {
+            this.toast('R-18 content is disabled by site administrator.');
+            return;
+          }
+          this.r18Enabled = !!enabled;
+          localStorage.setItem('r18_enabled', this.r18Enabled ? '1' : '0');
+          this.initR18Toggle();
+          this.toast(this.r18Enabled ? 'R-18 content turned ON' : 'R-18 content turned OFF');
+          const currentRoute = (window.location.hash || '').replace(/^#/, '').split('?')[0];
+          if (!this.r18Enabled && currentRoute === '/r18') {
+            this.nav('#/');
+          } else {
+            this.handleRoute();
+          }
+        }
+
+        shouldBlurR18(itemRating) {
+          if (itemRating !== 'r18') return false;
+          if (this.r18Policy === 'login_only') return false; // Required login has NO blur for members
+          return true; // Always blur R-18 until clicked
         }
   
         toggleSidebar() {
@@ -4599,6 +4793,19 @@ if ($action) {
           if (this.needsSetup) {
             await this.renderSetupPage();
             return;
+          }
+
+          if (routePath === '/r18') {
+            if (this.r18Policy === 'disabled') {
+              this.toast('R-18 content is currently disabled by administrator.');
+              this.nav('#/');
+              return;
+            }
+            if (!this.r18Enabled) {
+              this.toast('R-18 content is currently turned off.');
+              this.nav('#/');
+              return;
+            }
           }
   
           document.querySelectorAll('.nav-item').forEach(el => {
@@ -4863,7 +5070,8 @@ if ($action) {
           const character = params.get('character') || '';
           const parody = params.get('parody') || '';
           const sourceUrl = params.get('source_url') || '';
-          const rating = feedType === 'r18' ? 'r18' : (params.get('rating') || 'all');
+          let rating = feedType === 'r18' ? 'r18' : (params.get('rating') || (this.r18Enabled ? 'all' : 'safe'));
+          if (!this.r18Enabled || this.r18Policy === 'disabled') rating = 'safe';
           const type = params.get('type') || 'all';
           const sort = feedType === 'rankings' ? 'popular' : (params.get('sort') || 'newest');
           const period = params.get('period') || 'daily';
@@ -4971,10 +5179,17 @@ if ($action) {
                 const rawTags = (art.tags || '').split(/[,#、\s]+/).filter(Boolean);
                 const previewTags = rawTags.slice(0, 2);
 
+                const isBlurCard = this.shouldBlurR18(art.rating);
                 html += `
                   <div class="art-card" onclick="app.nav('#/artwork/${art.id}')">
-                    <div class="art-thumb-wrap">
-                      ${coverUrl ? `<img src="${coverUrl}" alt="" loading="lazy" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(coverFileName)}'">` : '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted);">No Media</div>'}
+                    <div class="art-thumb-wrap position-relative">
+                      ${isBlurCard ? `
+                        <div class="safe-blur-overlay" onclick="event.stopPropagation(); this.parentElement.classList.toggle('safe-blur-revealed');" title="Sensitive content &bull; Click to reveal">
+                          <svg viewBox="0 0 24 24" style="width:20px;height:20px;"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+                          <span style="font-size:0.68rem; font-weight:800; letter-spacing:0.5px;">R-18 CONTENT</span>
+                        </div>
+                      ` : ''}
+                      ${coverUrl ? `<img src="${coverUrl}" class="${isBlurCard ? 'safe-blur-target' : ''}" alt="" loading="lazy" onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(coverFileName)}'">` : '<div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted);">No Media</div>'}
                       ${pageCount > 1 ? `<div class="badge-page-count"><svg viewBox="0 0 24 24" style="width:13px;height:13px;"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14z"/></svg> ${pageCount}P</div>` : ''}
                       ${art.type === 'manga' ? `<div class="badge-flag manga">MANGA</div>` : ''}
                       ${isVid ? `<div class="badge-flag video">VIDEO</div>` : ''}
@@ -5782,6 +5997,7 @@ if ($action) {
                   <button class="admin-tab-btn" id="atb-art" onclick="app.adminSwitchTab('art')">Manage Posts</button>
                   <button class="admin-tab-btn" id="atb-add_admin" onclick="app.adminSwitchTab('add_admin')">Appoint Admin</button>
                   <button class="admin-tab-btn" id="atb-comments" onclick="app.adminSwitchTab('comments')">Comment Moderation</button>
+                  <button class="admin-tab-btn" id="atb-settings" onclick="app.adminSwitchTab('settings')">Site Settings &amp; Limits</button>
                   <button class="admin-tab-btn" id="atb-sys" onclick="app.adminSwitchTab('sys')">System Diagnostics</button>
                 </div>
 
@@ -6093,6 +6309,59 @@ if ($action) {
                 <div><strong>Storage Directory:</strong> <?= htmlspecialchars(str_replace('\\', '/', $config['data_dir'])) ?></div>
               </div>
             `;
+          } else if (tab === 'settings') {
+            const currentSettings = await this.api('admin_settings_get');
+            box.innerHTML = `
+              <div style="background:var(--bg-surface); padding:1.6rem; border:1px solid var(--border-subtle); border-radius:14px; width:100%;">
+                <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:0.4rem;">Site Upload Limits &amp; Content Moderation</h3>
+                <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:1.4rem;">Configure global policies for R-18 works, media limits, and daily quotas.</p>
+
+                <form onsubmit="app.handleAdminSettingsSubmit(event)" style="display:flex; flex-direction:column; gap:1.2rem; max-width:640px;">
+                  <div class="form-group">
+                    <label class="form-label">R-18 Content Display Policy</label>
+                    <select name="r18_policy" class="form-select custom-select">
+                      <option value="blur" ${currentSettings.r18_policy === 'blur' ? 'selected' : ''}>Always Blur (Blur R-18 content until clicked)</option>
+                      <option value="login_only" ${currentSettings.r18_policy === 'login_only' ? 'selected' : ''}>Require Login (No blur for logged-in members, hidden for guests)</option>
+                      <option value="disabled" ${currentSettings.r18_policy === 'disabled' ? 'selected' : ''}>Disabled (Block and disallow all R-18 content completely)</option>
+                    </select>
+                    <span style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem;">
+                      "Require Login" removes blurring for active members while completely shielding unregistered visitors.
+                    </span>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">Maximum Media Items in One Post</label>
+                    <input type="number" name="max_images_per_post" class="form-input" min="1" max="1000" value="${currentSettings.max_images_per_post || 500}" required>
+                    <span style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem;">Applies to multi-page illustrations and comic series (default: 500).</span>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">Daily Upload Limit for Individual Posts (per 24 Hours)</label>
+                    <input type="number" name="daily_limit" class="form-input" min="1" max="500" value="${currentSettings.daily_limit || 10}" required>
+                    <span style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem;">Limits daily single-image posts to prevent feed spam (bypassed for Administrators).</span>
+                  </div>
+
+                  <div style="display:flex; justify-content:flex-end; margin-top:0.6rem;">
+                    <button type="submit" class="btn-primary" id="btn-save-settings">Save Settings</button>
+                  </div>
+                </form>
+              </div>
+            `;
+          }
+        }
+
+        async handleAdminSettingsSubmit(e) {
+          e.preventDefault();
+          const btn = document.getElementById('btn-save-settings');
+          if (btn) { btn.disabled = true; btn.innerText = 'Saving...'; }
+          const fd = new FormData(e.target);
+          try {
+            await this.api('admin_settings_save', fd, 'POST');
+            this.toast('Settings updated successfully!');
+            setTimeout(() => location.reload(), 600);
+          } catch(err) {
+            this.toast(err.message);
+            if (btn) { btn.disabled = false; btn.innerText = 'Save Settings'; }
           }
         }
 
@@ -6155,6 +6424,16 @@ if ($action) {
   
           try {
             const art = await this.api('artwork_get', { id });
+            if (art.rating === 'r18' && !this.r18Enabled && this.r18Policy !== 'login_only') {
+              container.innerHTML = `
+                <div class="center-msg" style="max-width:480px; margin:4rem auto; background:var(--bg-surface); border:1px solid var(--border-subtle); border-radius:14px; padding:2rem;">
+                  <h2 style="font-size:1.25rem; font-weight:800; color:var(--r18); margin-bottom:0.6rem;">R-18 Mature Content</h2>
+                  <p style="color:var(--text-muted); font-size:0.85rem; line-height:1.5; margin-bottom:1.4rem;">This creation contains mature content. Enable R-18 in the sidebar to view.</p>
+                  <button type="button" class="btn-primary" onclick="app.toggleR18(true)">Enable R-18 Content</button>
+                </div>
+              `;
+              return;
+            }
             this.setTitle(`${art.title} by ${art.artist_name}`);
             this.currentArt = art;
             this.currentLeadIndex = 0;
@@ -6204,7 +6483,14 @@ if ($action) {
                         </video>
                       ` : `
                         <div class="spinner" id="preview-loading-spinner" style="position:absolute; margin:auto; display:none;"></div>
-                        <img id="main-artwork-display" src="?action=thumb&f=${encodeURIComponent(leadImg.file_name || '')}"
+                        ${this.shouldBlurR18(art.rating) ? `
+                          <div class="safe-blur-overlay" onclick="event.stopPropagation(); this.parentElement.classList.toggle('safe-blur-revealed');" title="Sensitive content &bull; Click to reveal">
+                            <svg viewBox="0 0 24 24" style="width:36px;height:36px;"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+                            <span style="font-size:0.95rem; font-weight:800; letter-spacing:0.5px;">R-18 SENSITIVE WORK</span>
+                            <span style="font-size:0.75rem; opacity:0.8;">Click to reveal</span>
+                          </div>
+                        ` : ''}
+                        <img id="main-artwork-display" class="${this.shouldBlurR18(art.rating) ? 'safe-blur-target' : ''}" src="?action=thumb&f=${encodeURIComponent(leadImg.file_name || '')}"
                              data-raw="?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}"
                              data-loaded="0"
                              onerror="this.onerror=null; this.src='?action=raw&f=${encodeURIComponent(leadImg.file_name || '')}';"
@@ -6342,14 +6628,10 @@ if ($action) {
                       </div>
                       ${isOwner ? `
                         <div class="artwork-owner-actions">
-                          <button type="button" class="btn-subtle" style="gap:0.35rem;" onclick="app.exportArtworkPost(${art.id})" title="Export Post Package (.zip) with live progress">
-                            <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                            <span>Export Post (.zip)</span>
-                          </button>
                           <button class="btn-subtle" onclick="app.nav('#/edit/${art.id}')">Edit Post</button>
                           <button class="btn-subtle" style="color:var(--r18);" onclick="app.deleteArtwork(${art.id})">Delete</button>
                         </div>
-                    ` : ''}
+                      ` : ''}
                     </div>
 
                     ${art.source_url ? (() => {
@@ -7260,7 +7542,7 @@ if ($action) {
               <h2 style="font-size:1.4rem; font-weight:800; margin:0;">${editId ? 'Edit Artwork Studio' : 'Publish Artwork or Video'}</h2>
               <div style="display:flex; gap:0.5rem; align-items:center;">
                 ${editId ? `
-                  <button type="button" class="btn-subtle" style="gap:0.4rem;" onclick="app.exportArtworkPost(${editId})" title="Export Post Package (.zip) with progress">
+                  <button type="button" class="btn-primary" style="gap:0.4rem;" onclick="app.exportArtworkPost(${editId})" title="Export Post Package (.zip) with progress">
                     <svg viewBox="0 0 24 24" style="width:15px;height:15px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                     <span>Export Post (.zip)</span>
                   </button>
@@ -7311,7 +7593,7 @@ if ($action) {
                 <div class="upload-zone" id="studio-dropzone" onclick="document.getElementById('studio-file-input').click()">
                   <svg viewBox="0 0 24 24" style="width:40px; height:40px; color:var(--accent);"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
                   <span style="font-weight:700; font-size:0.95rem;">Drop multiple files here or click to browse</span>
-                  <span style="font-size:0.75rem; color:var(--text-muted);">Max 500 images per post &bull; 10 images/day for separate individual posts</span>
+                  <span style="font-size:0.75rem; color:var(--text-muted);">Max ${this.maxImagesPerPost} images per post &bull; ${this.dailyUploadLimit} images/day for separate individual posts</span>
                 </div>
                 <input type="file" id="studio-file-input" multiple style="display:none;" accept="image/*,video/*" onchange="app.handleStudioFiles(this.files)">
           
@@ -7475,8 +7757,8 @@ if ($action) {
         async handleStudioFiles(files) {
           if (!files || !files.length) return;
 
-          if (this.uploadQueue.length + files.length > 500) {
-            this.toast(`Upload limit exceeded: A post can have at most 500 images (current: ${this.uploadQueue.length}, added: ${files.length}).`);
+          if (this.uploadQueue.length + files.length > this.maxImagesPerPost) {
+            this.toast(`Upload limit exceeded: A post can have at most ${this.maxImagesPerPost} images (current: ${this.uploadQueue.length}, added: ${files.length}).`);
             return;
           }
 
